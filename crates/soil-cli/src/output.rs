@@ -28,7 +28,7 @@ fn note(r: &EvidenceRecord) -> String {
     let pick = [
         d["reason"].as_str().map(String::from),
         d["cause"]["reason"].as_str().map(String::from),
-        d["outcome"]["outcome"].as_str().map(|o| format!("adapter: {o}")),
+        d["outcome"]["kind"].as_str().map(|o| format!("adapter: {o}")),
         d["invariant"].as_str().map(|i| match d["result"].as_str() {
             Some(r) => format!("{i} = {r}"),
             None => format!("{i}: {}", d["expr"].as_str().unwrap_or("")),
@@ -239,12 +239,27 @@ pub fn print_adapters(catalog: &AdapterCatalog) {
                 format!("{:?}", o.idempotency).to_lowercase(),
                 format!("{:?}", o.verification).to_lowercase(),
                 format!("{:?}", o.uncertainty).to_lowercase(),
-                o.resource_pattern,
+                o.resource_type,
                 o.compensation
-                    .as_deref()
+                    .operation()
                     .map(|c| format!("  (compensation: {c})"))
                     .unwrap_or_default()
             );
+            let fields = |s: &soil_core::adapter::Schema| {
+                s.fields
+                    .iter()
+                    .map(|(k, f)| {
+                        let req = if s.required.contains(k) { "" } else { "?" };
+                        format!("{k}{req}: {}", format!("{:?}", f.ty).to_lowercase())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!("      id {}  resource {}", o.id, o.resource_pattern);
+            println!("      in  {{{}}}  out {{{}}}", fields(&o.input), fields(&o.output));
+            if !o.postconditions.is_empty() {
+                println!("      post {}", o.postconditions.join(" && "));
+            }
         }
         println!();
     }

@@ -226,3 +226,16 @@ fn commit_boundary_must_reference_forward_nodes() {
     doc.spec.commit.on_violation = vec!["look".into()];
     assert_eq!(check(&doc).errors.iter().filter(|e| e.code == "commit").count(), 2);
 }
+
+#[test]
+fn input_schema_is_checked_statically() {
+    let mut doc = flow();
+    doc.spec.nodes[1].params["color"] = serde_json::json!(7);
+    doc.spec.nodes[1].params["shape"] = serde_json::json!("round");
+    let r = check(&doc);
+    assert!(r.has_error("param-type"), "{r}");
+    assert!(r.warnings.iter().any(|w| w.code == "param-unknown"), "{r}");
+    // Placeholders are only checked once rendered at dispatch.
+    doc.spec.nodes[1].params["color"] = serde_json::json!("${inputs.color}");
+    assert!(!check(&doc).has_error("param-type"));
+}

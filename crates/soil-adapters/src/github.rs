@@ -1,81 +1,116 @@
 //! GitHub: repository inspection, branch commits and pull requests.
 
-use crate::support::{self, observation, outcome, param_str, read, rejected, OpSpec, Read};
+use crate::support::{self, absent, failure, inconclusive, observed, outcome, param_str, read, Op, Read};
 use crate::transport::Transport;
 use serde_json::{json, Value};
-use soil_core::adapter::{Adapter, AdapterDescriptor, ExecutionOutcome, Invocation, Observation};
-use soil_core::model::{
-    EffectKind, IdempotencyBehavior, Presence, Reversibility, UncertaintySemantics,
-    VerificationStrategy,
-};
+use soil_core::adapter::{Adapter, AdapterDescriptor, AdapterResult, Invocation, Schema, SchemaType as T};
+use soil_core::model::{EffectKind, IdempotencyBehavior, Presence, Reversibility};
 use std::sync::Arc;
 
 const PROVIDER: &str = "github";
 
-fn ops() -> Vec<OpSpec> {
+fn pull_output() -> Schema {
+    Schema::of(&[
+        ("number", T::Integer, true),
+        ("state", T::String, true),
+        ("head", T::String, true),
+        ("base", T::String, false),
+        ("url", T::String, false),
+    ])
+}
 
+fn ops() -> Vec<soil_core::adapter::OperationDescriptor> {
     vec![
-        OpSpec::read(
+        Op::read(
+            PROVIDER,
             "repo.inspect",
             "Read repository metadata and the default branch head",
+            "github.repository",
             "github://{owner}/{repo}",
-        ),
-        OpSpec {
-            name: "branch.commit",
-            description: "Create a branch containing one commit with the given file changes",
-            read_only: false,
-            effect: EffectKind::Create,
-            resource: "github://{owner}/{repo}/branches/{branch}",
-            params: &["branch", "message", "files"],
-            preconditions: &["exists(params.files)"],
-            idempotency: IdempotencyBehavior::Keyed,
-            reversibility: Reversibility::Compensatable,
-            verification: VerificationStrategy::ReadBack,
-            compensation: Some("branch.delete"),
-            uncertainty: UncertaintySemantics::Reconcilable,
-        },
-        OpSpec {
-            name: "branch.delete",
-            description: "Delete a branch",
-            read_only: false,
-            effect: EffectKind::Delete,
-            resource: "github://{owner}/{repo}/branches/{branch}",
-            params: &["branch"],
-            preconditions: &[],
-            idempotency: IdempotencyBehavior::Natural,
-            reversibility: Reversibility::Irreversible,
-            verification: VerificationStrategy::ReadBack,
-            compensation: None,
-            uncertainty: UncertaintySemantics::Reconcilable,
-        },
-        OpSpec {
-            name: "pull_request.create",
-            description: "Open a pull request from a head branch",
-            read_only: false,
-            effect: EffectKind::Create,
-            resource: "github://{owner}/{repo}/pulls/{head}",
-            params: &["head", "base", "title"],
-            preconditions: &[],
-            idempotency: IdempotencyBehavior::Natural,
-            reversibility: Reversibility::Compensatable,
-            verification: VerificationStrategy::ReadBack,
-            compensation: Some("pull_request.close"),
-            uncertainty: UncertaintySemantics::Reconcilable,
-        },
-        OpSpec {
-            name: "pull_request.close",
-            description: "Close a pull request without merging",
-            read_only: false,
-            effect: EffectKind::Update,
-            resource: "github://{owner}/{repo}/pulls/{head}",
-            params: &["number"],
-            preconditions: &[],
-            idempotency: IdempotencyBehavior::Natural,
-            reversibility: Reversibility::Reversible,
-            verification: VerificationStrategy::ReadBack,
-            compensation: None,
-            uncertainty: UncertaintySemantics::Reconcilable,
-        },
+        )
+        .output(Schema::of(&[
+            ("full_name", T::String, true),
+            ("default_branch", T::String, true),
+            ("head_sha", T::String, true),
+            ("archived", T::Boolean, true),
+        ]))
+        .build(),
+        Op::write(
+            PROVIDER,
+            "branch.commit",
+            "Create a branch containing one commit with the given file changes",
+            "github.branch",
+            "github://{owner}/{repo}/branches/{branch}",
+            EffectKind::Create,
+            "a new branch whose head commit carries the given message and files",
+        )
+        .input(
+            Schema::of(&[
+                ("branch", T::String, true),
+                ("message", T::String, true),
+                ("files", T::Object, true),
+                ("base", T::String, false),
+            ])
+            .allowing_additional(),
+        )
+        .output(Schema::of(&[
+            ("branch", T::String, true),
+            ("sha", T::String, true),
+            ("base", T::String, false),
+            ("message", T::String, false),
+        ]))
+        .pre(&["exists(params.files)"])
+        .post(&["observed.branch == params.branch", "observed.message == params.message"])
+        .idempotency(IdempotencyBehavior::Keyed)
+        .reversibility(Reversibility::Compensatable)
+        .compensated_by("branch.delete", &[("branch", "${target.params.branch}")])
+        .build(),
+        Op::write(
+            PROVIDER,
+            "branch.delete",
+            "Delete a branch",
+            "github.branch",
+            "github://{owner}/{repo}/branches/{branch}",
+            EffectKind::Delete,
+            "the branch no longer exists",
+        )
+        .input(Schema::of(&[("branch", T::String, true)]))
+        .output(Schema::of(&[("deleted", T::Boolean, true)]))
+        .reversibility(Reversibility::Irreversible)
+        .build(),
+        Op::write(
+            PROVIDER,
+            "pull_request.create",
+            "Open a pull request from a head branch",
+            "github.pull_request",
+            "github://{owner}/{repo}/pulls/{head}",
+            EffectKind::Create,
+            "an open pull request from head into base",
+        )
+        .input(Schema::of(&[
+            ("head", T::String, true),
+            ("base", T::String, true),
+            ("title", T::String, true),
+            ("body", T::String, false),
+        ]))
+        .output(pull_output())
+        .post(&["observed.state == \"open\"", "observed.head == params.head"])
+        .reversibility(Reversibility::Compensatable)
+        .compensated_by("pull_request.close", &[("number", "${target.observed.number}")])
+        .build(),
+        Op::write(
+            PROVIDER,
+            "pull_request.close",
+            "Close a pull request without merging",
+            "github.pull_request",
+            "github://{owner}/{repo}/pulls/{head}",
+            EffectKind::Update,
+            "the pull request is closed",
+        )
+        .input(Schema::of(&[("number", T::Integer, true)]))
+        .output(pull_output())
+        .post(&["observed.state == \"closed\""])
+        .build(),
     ]
 }
 
@@ -92,7 +127,7 @@ impl GitHubAdapter {
                 adapter_type: PROVIDER.into(),
                 version: 1,
                 description: "GitHub repositories, branches and pull requests".into(),
-                operations: ops().iter().map(OpSpec::descriptor).collect(),
+                operations: ops(),
             },
         }
     }
@@ -140,16 +175,16 @@ impl Adapter for GitHubAdapter {
         &self.descriptor
     }
 
-    fn execute(&self, inv: &Invocation) -> ExecutionOutcome {
+    fn execute(&self, inv: &Invocation) -> AdapterResult {
         let Some(repo) = Self::repo_path(inv) else {
-            return rejected(format!("'{}' is not a github:// repository resource", inv.resource));
+            return failure(format!("'{}' is not a github:// repository resource", inv.resource));
         };
         let (method, path, body, normalize): (&str, String, Value, fn(&Value) -> Value) =
             match inv.operation.as_str() {
                 "repo.inspect" => ("GET", repo, Value::Null, normalize_repo),
                 "branch.commit" => {
                     let Some(branch) = param_str(inv, "branch") else {
-                        return rejected("missing param 'branch'");
+                        return failure("missing param 'branch'");
                     };
                     (
                         "POST",
@@ -165,7 +200,7 @@ impl Adapter for GitHubAdapter {
                 }
                 "branch.delete" => {
                     let Some(branch) = param_str(inv, "branch") else {
-                        return rejected("missing param 'branch'");
+                        return failure("missing param 'branch'");
                     };
                     ("DELETE", format!("{repo}/git/refs/heads/{branch}"), Value::Null, |_| {
                         json!({ "deleted": true })
@@ -184,58 +219,51 @@ impl Adapter for GitHubAdapter {
                 ),
                 "pull_request.close" => {
                     let Some(n) = inv.params.get("number").and_then(Value::as_u64) else {
-                        return rejected("missing numeric param 'number'");
+                        return failure("missing numeric param 'number'");
                     };
                     ("PATCH", format!("{repo}/pulls/{n}"), json!({"state": "closed"}), normalize_pull)
                 }
-                other => return rejected(format!("unknown operation '{other}'")),
+                other => return failure(format!("unknown operation '{other}'")),
             };
-        let response = self
-            .transport
-            .call(&support::request(PROVIDER, inv, method, path, body));
-        outcome(response, normalize)
+        outcome(
+            self.transport.call(&support::request(PROVIDER, inv, method, path, body)),
+            normalize,
+        )
     }
 
-    fn observe(&self, inv: &Invocation) -> Observation {
+    fn observe(&self, inv: &Invocation) -> AdapterResult {
         let Some(repo) = Self::repo_path(inv) else {
-            return Observation::unknown("invalid resource");
+            return inconclusive("invalid resource");
         };
-        let unknown = |r: String| Observation::unknown(r);
         match inv.operation.as_str() {
             "repo.inspect" => match self.get(inv, repo) {
-                Read::Found(b) => observation(Presence::Present, normalize_repo(&b)),
-                Read::NotFound => observation(Presence::Absent, Value::Null),
-                Read::Unknown(r) => unknown(r),
+                Read::Found(b) => observed(Presence::Present, normalize_repo(&b)),
+                Read::NotFound => absent(),
+                Read::Unknown(r) => r,
             },
             "branch.commit" | "branch.delete" => {
                 let branch = param_str(inv, "branch").unwrap_or_default();
                 let found = self.get(inv, format!("{repo}/git/ref/heads/{branch}"));
                 let deleting = inv.operation == "branch.delete";
                 match found {
-                    Read::Found(b) if deleting => observation(Presence::Absent, normalize_ref(&b)),
-                    Read::NotFound if deleting => {
-                        observation(Presence::Present, json!({ "deleted": true }))
-                    }
-                    Read::Found(b) => {
-                        let state = normalize_ref(&b);
-                        let matches = state["message"] == inv.params["message"];
-                        let p = if matches { Presence::Present } else { Presence::Partial };
-                        observation(p, state)
-                    }
-                    Read::NotFound => observation(Presence::Absent, Value::Null),
-                    Read::Unknown(r) => unknown(r),
+                    Read::Found(b) if deleting => observed(Presence::Absent, normalize_ref(&b)),
+                    Read::NotFound if deleting => observed(Presence::Present, json!({ "deleted": true })),
+                    // The branch exists; postconditions decide whether it is *our* commit.
+                    Read::Found(b) => observed(Presence::Present, normalize_ref(&b)),
+                    Read::NotFound => absent(),
+                    Read::Unknown(r) => r,
                 }
             }
             "pull_request.create" => {
                 let head = param_str(inv, "head").unwrap_or_default();
                 match self.get(inv, format!("{repo}/pulls?head={head}&state=open")) {
                     Read::Found(Value::Array(prs)) => match prs.first() {
-                        Some(pr) => observation(Presence::Present, normalize_pull(pr)),
-                        None => observation(Presence::Absent, Value::Null),
+                        Some(pr) => observed(Presence::Present, normalize_pull(pr)),
+                        None => absent(),
                     },
-                    Read::Found(_) => unknown("unexpected pull list shape".into()),
-                    Read::NotFound => observation(Presence::Absent, Value::Null),
-                    Read::Unknown(r) => unknown(r),
+                    Read::Found(_) => inconclusive("unexpected pull list shape"),
+                    Read::NotFound => absent(),
+                    Read::Unknown(r) => r,
                 }
             }
             "pull_request.close" => {
@@ -243,18 +271,14 @@ impl Adapter for GitHubAdapter {
                 match self.get(inv, format!("{repo}/pulls/{n}")) {
                     Read::Found(b) => {
                         let state = normalize_pull(&b);
-                        let p = if state["state"] == "closed" {
-                            Presence::Present
-                        } else {
-                            Presence::Absent
-                        };
-                        observation(p, state)
+                        let p = if state["state"] == "closed" { Presence::Present } else { Presence::Absent };
+                        observed(p, state)
                     }
-                    Read::NotFound => observation(Presence::Absent, Value::Null),
-                    Read::Unknown(r) => unknown(r),
+                    Read::NotFound => absent(),
+                    Read::Unknown(r) => r,
                 }
             }
-            other => unknown(format!("unknown operation '{other}'")),
+            other => inconclusive(format!("unknown operation '{other}'")),
         }
     }
 }

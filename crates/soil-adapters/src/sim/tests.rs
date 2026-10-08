@@ -1,11 +1,11 @@
 use super::*;
 use crate::{catalog, registry};
 use serde_json::json;
-use soil_core::adapter::{AdapterRegistry, ExecutionOutcome, Invocation};
+use soil_core::adapter::{AdapterRegistry, AdapterResult, Invocation, ResultKind, UncertaintyCause};
 use soil_core::model::Presence;
 use std::sync::Arc;
 
-fn world() -> WorldState {
+pub(crate) fn world() -> WorldState {
     let mut w = WorldState::default();
     w.repos.insert(
         "acme/checkout".into(),
@@ -67,61 +67,80 @@ fn rollout(node: &str) -> Invocation {
     inv(node, "deployment.rollout", DEPLOY, json!({"image": "app:2", "config_version": "cfg-2"}))
 }
 
+fn presence(r: &AdapterResult) -> Option<Presence> {
+    match r {
+        AdapterResult::ObservedState { presence, .. } => Some(*presence),
+        _ => None,
+    }
+}
+
+fn state(r: AdapterResult) -> Value {
+    match r {
+        AdapterResult::Success { state } | AdapterResult::ObservedState { state, .. } => state,
+        other => panic!("expected a state, got {other:?}"),
+    }
+}
+
+fn cause(r: &AdapterResult) -> Option<UncertaintyCause> {
+    match r {
+        AdapterResult::Uncertain { cause, .. } => Some(*cause),
+        _ => None,
+    }
+}
+
 #[test]
-fn rollout_applies_and_is_observed() {
+fn rollout_succeeds_and_is_observed() {
     let (_, r) = setup(&[]);
     let k8s = r.get("kubernetes").unwrap();
-    let ExecutionOutcome::Applied { observed } = k8s.execute(&rollout("deploy")) else {
-        panic!("expected applied")
-    };
+    let observed = state(k8s.execute(&rollout("deploy")));
     assert_eq!(observed["image"], "app:2");
     assert_eq!(observed["previous_image"], "app:1");
     assert_eq!(observed["previous_config_version"], "cfg-1");
-    let obs = k8s.observe(&rollout("deploy"));
-    assert_eq!(obs.presence, Presence::Present);
+    assert_eq!(presence(&k8s.observe(&rollout("deploy"))), Some(Presence::Present));
 }
 
 #[test]
-fn timeout_after_apply_is_reported_as_timeout_but_observable() {
+fn timeout_after_apply_is_uncertain_and_observably_present() {
     let (_, r) = setup(&[("deploy", Fault::TimeoutAfterApply)]);
     let k8s = r.get("kubernetes").unwrap();
-    assert_eq!(k8s.execute(&rollout("deploy")), ExecutionOutcome::TimedOut);
-    assert_eq!(k8s.observe(&rollout("deploy")).presence, Presence::Present);
+    let result = k8s.execute(&rollout("deploy"));
+    assert_eq!(result.kind(), ResultKind::Uncertain, "a timeout is not a failure");
+    assert_eq!(cause(&result), Some(UncertaintyCause::Timeout));
+    assert_eq!(presence(&k8s.observe(&rollout("deploy"))), Some(Presence::Present));
 }
 
 #[test]
-fn timeout_before_apply_leaves_nothing() {
+fn timeout_before_apply_is_uncertain_and_observably_absent() {
     let (_, r) = setup(&[("deploy", Fault::TimeoutBeforeApply)]);
     let k8s = r.get("kubernetes").unwrap();
-    assert_eq!(k8s.execute(&rollout("deploy")), ExecutionOutcome::TimedOut);
-    assert_eq!(k8s.observe(&rollout("deploy")).presence, Presence::Absent);
+    assert_eq!(k8s.execute(&rollout("deploy")).kind(), ResultKind::Uncertain);
+    assert_eq!(presence(&k8s.observe(&rollout("deploy"))), Some(Presence::Absent));
 }
 
 #[test]
 fn provider_errors_normalize() {
     let (_, r) = setup(&[("a", Fault::ServerError), ("b", Fault::Reject), ("c", Fault::LostAfterApply)]);
     let k8s = r.get("kubernetes").unwrap();
-    assert!(matches!(k8s.execute(&rollout("a")), ExecutionOutcome::Ambiguous { .. }));
-    assert!(matches!(k8s.execute(&rollout("b")), ExecutionOutcome::Rejected { .. }));
-    assert!(matches!(k8s.execute(&rollout("c")), ExecutionOutcome::Ambiguous { .. }));
-    assert_eq!(k8s.observe(&rollout("c")).presence, Presence::Present);
+    assert_eq!(cause(&k8s.execute(&rollout("a"))), Some(UncertaintyCause::ServerError));
+    assert_eq!(k8s.execute(&rollout("b")).kind(), ResultKind::Failure);
+    assert_eq!(cause(&k8s.execute(&rollout("c"))), Some(UncertaintyCause::ConnectionLost));
+    assert_eq!(presence(&k8s.observe(&rollout("c"))), Some(Presence::Present));
 }
 
 #[test]
 fn partial_effects_are_observed_as_partial() {
     let (_, r) = setup(&[("deploy", Fault::Partial), ("shift", Fault::Partial)]);
     let k8s = r.get("kubernetes").unwrap();
-    assert!(matches!(k8s.execute(&rollout("deploy")), ExecutionOutcome::Applied { .. }));
-    assert_eq!(k8s.observe(&rollout("deploy")).presence, Presence::Partial);
+    assert_eq!(k8s.execute(&rollout("deploy")).kind(), ResultKind::Success);
+    assert_eq!(presence(&k8s.observe(&rollout("deploy"))), Some(Presence::Partial));
 
     let shift = inv("shift", "traffic.shift", TRAFFIC, json!({"canary_weight": 100}));
-    let ExecutionOutcome::Applied { observed } = k8s.execute(&shift) else { panic!() };
-    assert_eq!(observed["canary"], 50);
-    assert_eq!(k8s.observe(&shift).presence, Presence::Partial);
+    assert_eq!(state(k8s.execute(&shift))["canary"], 50);
+    assert_eq!(presence(&k8s.observe(&shift)), Some(Presence::Partial));
 
     let restore = inv("restore", "traffic.restore", TRAFFIC, json!({"canary_weight": 0}));
-    assert!(matches!(k8s.execute(&restore), ExecutionOutcome::Applied { .. }));
-    assert_eq!(k8s.observe(&restore).presence, Presence::Present);
+    assert_eq!(k8s.execute(&restore).kind(), ResultKind::Success);
+    assert_eq!(presence(&k8s.observe(&restore)), Some(Presence::Present));
 }
 
 #[test]
@@ -133,37 +152,25 @@ fn faults_combine() {
     ));
     let r = registry(sim);
     let k8s = r.get("kubernetes").unwrap();
-    assert_eq!(k8s.execute(&rollout("deploy")), ExecutionOutcome::TimedOut);
-    assert_eq!(k8s.observe(&rollout("deploy")).presence, Presence::Unknown);
-}
-
-#[test]
-fn unobservable_reads_are_unknown() {
-    let (_, r) = setup(&[("deploy", Fault::Unobservable)]);
-    let k8s = r.get("kubernetes").unwrap();
-    assert!(matches!(k8s.execute(&rollout("deploy")), ExecutionOutcome::Applied { .. }));
-    assert_eq!(k8s.observe(&rollout("deploy")).presence, Presence::Unknown);
+    assert_eq!(k8s.execute(&rollout("deploy")).kind(), ResultKind::Uncertain);
+    assert_eq!(k8s.observe(&rollout("deploy")).kind(), ResultKind::Uncertain);
 }
 
 #[test]
 fn status_includes_traffic() {
     let (_, r) = setup(&[]);
     let k8s = r.get("kubernetes").unwrap();
-    let ExecutionOutcome::Applied { observed } =
-        k8s.execute(&inv("s", "deployment.status", DEPLOY, Value::Null))
-    else {
-        panic!()
-    };
+    let observed = state(k8s.execute(&inv("s", "deployment.status", DEPLOY, Value::Null)));
     assert_eq!(observed["traffic"]["canary"], 0);
     assert_eq!(observed["ready"], true);
 }
 
 #[test]
-fn rejects_mismatched_resource_kinds() {
+fn rejects_mismatched_resource_kinds_without_sending() {
     let (sim, r) = setup(&[]);
     let k8s = r.get("kubernetes").unwrap();
     let bad = inv("x", "traffic.shift", DEPLOY, json!({"canary_weight": 10}));
-    assert!(matches!(k8s.execute(&bad), ExecutionOutcome::Rejected { .. }));
+    assert_eq!(k8s.execute(&bad).kind(), ResultKind::Failure);
     assert!(sim.calls().is_empty(), "nothing may be sent for invalid requests");
 }
 
@@ -172,10 +179,7 @@ fn github_branch_and_pull_request_lifecycle() {
     let (_, r) = setup(&[]);
     let gh = r.get("github").unwrap();
     let repo = "github://acme/checkout";
-    let ExecutionOutcome::Applied { observed } = gh.execute(&inv("inspect", "repo.inspect", repo, Value::Null)) else {
-        panic!()
-    };
-    assert_eq!(observed["head_sha"], "9f1c2ab");
+    assert_eq!(state(gh.execute(&inv("inspect", "repo.inspect", repo, Value::Null)))["head_sha"], "9f1c2ab");
 
     let commit = inv(
         "commit",
@@ -183,11 +187,10 @@ fn github_branch_and_pull_request_lifecycle() {
         "github://acme/checkout/branches/fix",
         json!({"branch": "fix", "base": "9f1c2ab", "message": "fix it", "files": {"a": "b"}}),
     );
-    let ExecutionOutcome::Applied { observed } = gh.execute(&commit) else { panic!() };
-    assert_eq!(observed["branch"], "fix");
-    assert_eq!(gh.observe(&commit).presence, Presence::Present);
+    assert_eq!(state(gh.execute(&commit))["branch"], "fix");
+    assert_eq!(presence(&gh.observe(&commit)), Some(Presence::Present));
     // Same idempotency key: provider returns the existing branch instead of a conflict.
-    assert!(matches!(gh.execute(&commit), ExecutionOutcome::Applied { .. }));
+    assert_eq!(gh.execute(&commit).kind(), ResultKind::Success);
 
     let pr = inv(
         "pr",
@@ -195,19 +198,18 @@ fn github_branch_and_pull_request_lifecycle() {
         "github://acme/checkout/pulls/fix",
         json!({"head": "fix", "base": "main", "title": "Fix"}),
     );
-    let ExecutionOutcome::Applied { observed } = gh.execute(&pr) else { panic!() };
-    let number = observed["number"].as_u64().unwrap();
-    assert_eq!(gh.observe(&pr).presence, Presence::Present);
+    let number = state(gh.execute(&pr))["number"].as_u64().unwrap();
+    assert_eq!(presence(&gh.observe(&pr)), Some(Presence::Present));
 
     let close = inv("close", "pull_request.close", "github://acme/checkout/pulls/fix", json!({"number": number}));
-    assert!(matches!(gh.execute(&close), ExecutionOutcome::Applied { .. }));
-    assert_eq!(gh.observe(&close).presence, Presence::Present);
-    assert_eq!(gh.observe(&pr).presence, Presence::Absent);
+    assert_eq!(gh.execute(&close).kind(), ResultKind::Success);
+    assert_eq!(presence(&gh.observe(&close)), Some(Presence::Present));
+    assert_eq!(presence(&gh.observe(&pr)), Some(Presence::Absent));
 
     let delete = inv("del", "branch.delete", "github://acme/checkout/branches/fix", json!({"branch": "fix"}));
-    assert!(matches!(gh.execute(&delete), ExecutionOutcome::Applied { .. }));
-    assert_eq!(gh.observe(&delete).presence, Presence::Present);
-    assert_eq!(gh.observe(&commit).presence, Presence::Absent);
+    assert_eq!(gh.execute(&delete).kind(), ResultKind::Success);
+    assert_eq!(presence(&gh.observe(&delete)), Some(Presence::Present));
+    assert_eq!(presence(&gh.observe(&commit)), Some(Presence::Absent));
 }
 
 #[test]
@@ -215,14 +217,13 @@ fn ci_runs_report_results_and_are_found_by_key() {
     let (_, r) = setup(&[("tests", Fault::FailResult)]);
     let ci = r.get("ci").unwrap();
     let ok = inv("ci", "pipeline.run", "ci://generic/main/fix", Value::Null);
-    let ExecutionOutcome::Applied { observed } = ci.execute(&ok) else { panic!() };
-    assert_eq!(observed["status"], "passed");
+    assert_eq!(state(ci.execute(&ok))["status"], "passed");
     let failing = inv("tests", "job.run", "ci://generic/unit/fix", json!({"job": "unit"}));
-    let ExecutionOutcome::Applied { observed } = ci.execute(&failing) else { panic!() };
-    assert_eq!(observed["status"], "failed");
+    // A failing test run is a *successful* operation whose result is "failed".
+    assert_eq!(state(ci.execute(&failing))["status"], "failed");
     let obs = ci.observe(&failing);
-    assert_eq!(obs.presence, Presence::Present);
-    assert_eq!(obs.state["status"], "failed");
+    assert_eq!(presence(&obs), Some(Presence::Present));
+    assert_eq!(state(obs)["status"], "failed");
 }
 
 #[test]
@@ -230,14 +231,10 @@ fn http_reads_and_unobservable_posts() {
     let (_, r) = setup(&[]);
     let http = r.get("http").unwrap();
     let get = inv("slo", "get", "https://slo/api", Value::Null);
-    let ExecutionOutcome::Applied { observed } = http.execute(&get) else { panic!() };
-    assert_eq!(observed["error_rate"], 0.001);
-    assert!(matches!(
-        http.execute(&inv("x", "get", "https://missing", Value::Null)),
-        ExecutionOutcome::Rejected { .. }
-    ));
+    assert_eq!(state(http.execute(&get))["error_rate"], 0.001);
+    assert_eq!(http.execute(&inv("x", "get", "https://missing", Value::Null)).kind(), ResultKind::Failure);
     let post = inv("p", "post", "https://hook", json!({"body": {}}));
-    assert_eq!(http.observe(&post).presence, Presence::Unknown);
+    assert_eq!(http.observe(&post).kind(), ResultKind::Uncertain);
 }
 
 #[test]
@@ -246,14 +243,14 @@ fn descriptors_are_complete_and_self_consistent() {
     assert_eq!(cat.keys().cloned().collect::<Vec<_>>(), ["ci", "github", "http", "kubernetes"]);
     for desc in cat.values() {
         for op in &desc.operations {
-            if let Some(c) = &op.compensation {
-                assert!(desc.operation(c).is_some(), "{}: compensation {c} missing", op.name);
+            assert_eq!(op.id, format!("{}.{}@v{}", desc.adapter_type, op.name, desc.version));
+            assert!(op.resource_type.starts_with(&desc.adapter_type), "{}", op.id);
+            if let Some(c) = op.compensation.operation() {
+                assert!(desc.operation(c).is_some(), "{}: compensation {c} missing", op.id);
             }
-            if op.read_only {
-                assert!(!op.effect.is_effectful(), "{} is read-only but effectful", op.name);
-            }
-            for p in &op.preconditions {
-                soil_core::expr::parse(p).unwrap_or_else(|e| panic!("{}: {e}", op.name));
+            assert_eq!(op.read_only, !op.effect.is_effectful(), "{}", op.id);
+            for e in op.preconditions.iter().chain(&op.postconditions) {
+                soil_core::expr::parse(e).unwrap_or_else(|err| panic!("{}: {err}", op.id));
             }
         }
     }

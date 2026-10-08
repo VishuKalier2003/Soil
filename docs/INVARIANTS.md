@@ -21,8 +21,12 @@ broken (test names in parentheses).
    commit invariant is SATISFIED (UNKNOWN blocks unless policy allows uncertainty). No
    operator resolution leads to `COMMITTED`. (`remediation::slo_violation_*`,
    `remediation::unknown_invariant_blocks_commit`)
-7. **Timeout is not failure.** A timeout moves the action to `UNCERTAIN` and the effect to
-   `UNKNOWN`; the runtime then reconciles by observation. (`remediation::timeout_but_applied_*`)
+7. **Timeout is not failure.** Adapters report a timeout as `UNCERTAIN`, never `FAILURE`. The
+   action moves to `UNCERTAIN` and the effect to `UNKNOWN`; the runtime then reconciles by
+   observation, which ends in a matched success or a *confirmed* failure.
+   (`contract::timeouts_are_uncertain_for_every_effectful_operation`,
+   `effects::timeout_followed_by_successful_reconciliation`,
+   `effects::timeout_followed_by_confirmed_failure`, `remediation::timeout_but_applied_*`)
 8. **Reconcile before act.** Nothing is retried or compensated while its effect is UNKNOWN.
    Unresolvable uncertainty ends in `MANUAL_INTERVENTION`. (`remediation::unresolvable_*`)
 9. **No implicit retries.** Each action is dispatched to its adapter at most once per run.
@@ -38,3 +42,14 @@ broken (test names in parentheses).
     waves apply outcomes in node-id order. (`remediation::deterministic_evidence`)
 13. **Authority is external.** Soil records the authority decision reference from the
     `AuthorityProvider` but never evaluates permissions itself.
+14. **Adapter results are normalized and untrusted.** `execute` yields SUCCESS / FAILURE /
+    UNCERTAIN and `observe` yields OBSERVED_STATE / UNCERTAIN. Anything else, and any output
+    violating the operation's schema, is treated as `UNCERTAIN(protocol_violation)`.
+    (`adapter::tests::contract_violations_become_uncertain_never_failure_or_success`,
+    `contract::every_operation_honours_the_result_contract_and_schemas`)
+15. **Invalid inputs are never sent.** Rendered params are checked against the operation's input
+    schema before dispatch; a violation blocks the node with zero adapter calls.
+    (`effects::invalid_inputs_are_never_dispatched`)
+16. **Success requires a matched effect.** An action succeeds only when EXPECTED vs OBSERVED is
+    `MATCHED`; `DIVERGED` fails it and `UNKNOWN` keeps it `UNCERTAIN`.
+    (`effect::tests::*`, `effects::effect_divergence`)

@@ -399,11 +399,11 @@ dispatch carries an idempotency key (declared template, or derived from tx id + 
 
 **Outcomes.**
 
-| Adapter outcome | Action | Effect |
+| Normalized result (§9) | Action | Effect |
 |---|---|---|
-| `Applied` | `EXECUTING → OBSERVING`, then read-back (if `read_back`) and postconditions | `NOT_OBSERVED → OBSERVING → OBSERVED → MATCHED / DIVERGED` |
-| `Rejected` (definitive) | `EXECUTING → FAILED` | stays `NOT_OBSERVED` (presence absent) |
-| `TimedOut` / `Ambiguous` | `EXECUTING → UNCERTAIN`, then up to `maxReconcileAttempts` observations | `NOT_OBSERVED → UNKNOWN → RECONCILING → …` |
+| `SUCCESS` | `EXECUTING → OBSERVING`, then read-back (if `read_back`) and EXPECTED-vs-OBSERVED comparison | `NOT_OBSERVED → OBSERVING → OBSERVED → MATCHED / DIVERGED` (or `UNKNOWN`) |
+| `FAILURE` (definitive) | `EXECUTING → FAILED` | stays `NOT_OBSERVED` (presence absent) until discovery |
+| `UNCERTAIN` | `EXECUTING → UNCERTAIN`, then up to `maxReconcileAttempts` observations | `NOT_OBSERVED → UNKNOWN → RECONCILING → …` |
 
 Presence `partial`, or `present` with a FALSE postcondition, is `DIVERGED` and fails the action
 with an effect that needs undoing. Read-only nodes (OBSERVE, VERIFY) may be re-read; effectful
@@ -457,7 +457,64 @@ transports implement the same `Transport` trait; the adapters' normalization doe
 | Unit — guarantees | derivation for compensatable / irreversible / unverified flows; requirement failures | `soil-core/src/guarantee.rs` |
 | Unit — evidence | hash chain verifies; tampering any field/record/order fails; redaction | `soil-core/src/evidence.rs` |
 | Unit — sealing | sealed hash stable across runs; amend bumps version; identical publish is a no-op | `soil-core/src/transaction.rs` |
-| Unit — adapters | normalization, descriptor completeness, sim fault behaviours | `soil-adapters` |
+| Unit — adapters | normalization, descriptor completeness, sim fault behaviours | `soil-adapters/src/sim/tests.rs` |
+| Contract — adapters | every operation: result kinds per method, input/output schema conformance, timeouts are UNCERTAIN | `soil-adapters/tests/contract.rs` |
+| Unit — effect comparison | MATCHED / DIVERGED (absent, partial, false postcondition) / UNKNOWN | `soil-core/src/effect.rs` |
+| Integration — effects | successful action; failed action; timeout → reconciled success; timeout → confirmed failure; divergence; successful verification; invalid inputs never dispatched | `soil-runtime/tests/effects.rs` |
 | Integration — runtime | remediation flow: happy commit; timeout-but-applied reconciled and committed; partial failure recovered; SLO violation compensated; compensation failure → PARTIALLY_RECOVERED/MANUAL; unresolvable uncertainty → MANUAL_INTERVENTION; determinism (two runs → identical evidence hashes); no retries (adapter call counts) | `soil-runtime/tests/remediation.rs` |
 | Integration — CLI | init → validate → publish → plan → run → status → inspect | `soil-cli/tests/cli.rs` |
 | Integration — API | publish draft, start run, read events, SSE content type | `soil-api/tests/api.rs` |
+
+---
+
+## 9. Adapter contract and effect comparison
+
+### Operation descriptors
+
+Every adapter operation is described declaratively (`soil_core::adapter::OperationDescriptor`):
+
+| Field | Meaning |
+|---|---|
+| `id` | globally unique, `<adapter>.<operation>@v<version>` (e.g. `kubernetes.deployment.rollout@v1`) |
+| `resourceType` / `resourcePattern` | normalized type (`kubernetes.deployment`) and address shape (`k8s://{cluster}/{namespace}/deployment/{name}`) |
+| `input` / `output` | flat typed schemas. Inputs are checked statically for literal values and at dispatch for rendered values; invalid inputs are `BLOCKED`, never sent. Outputs are checked on every `SUCCESS` and `OBSERVED_STATE`. |
+| `effect` / `effectSummary` | the expected effect of a successful execution |
+| `preconditions` / `postconditions` | expressions over `params` (and `observed` for postconditions); the flow can add more of its own |
+| `idempotency`, `reversibility`, `verification` | as in §2.1 |
+| `uncertainty` | `reconcilable` (actual state can be observed after an UNCERTAIN result) or `unreconcilable` |
+| `compensation` | capability only (`none`, or the undoing operation with suggested parameter templates). Soil never compensates automatically; a flow must still declare the COMPENSATE node. |
+
+The core knows nothing about any provider. Adapters translate to provider-shaped requests over a
+`Transport` and normalize the responses. The built-in adapters (GitHub, Kubernetes, CI, HTTP)
+run against deterministic mocked providers and need no credentials.
+
+### Normalized results
+
+| Result | Returned by | Meaning |
+|---|---|---|
+| `SUCCESS { state }` | `execute` | the provider confirmed the request; `state` matches the output schema |
+| `FAILURE { reason }` | `execute` | the provider definitively did not apply the request (e.g. 4xx) |
+| `UNCERTAIN { cause, detail }` | `execute`, `observe` | not known whether the effect happened (`timeout`, `connection_lost`, `server_error`, `inconclusive`, `protocol_violation`) |
+| `OBSERVED_STATE { presence, state }` | `observe` | actual state; presence is `present`, `partial` or `absent` relative to the intended effect |
+
+**A request timeout is never a failure.** It is `UNCERTAIN`, and Soil must observe before
+deciding: matched → the action succeeded; absent → *confirmed* failure (class `timeout`, never
+retried); still unknown → escalation. Contract violations (`execute` returning OBSERVED_STATE,
+`observe` returning SUCCESS/FAILURE, malformed output) are normalized to
+`UNCERTAIN(protocol_violation)`. A malformed result is never trusted as success or failure.
+
+### Effect comparison (EXPECTED vs OBSERVED)
+
+`soil_core::effect::compare(expected, observation, ctx)` is pure and three-valued:
+
+| Observation | Postconditions (adapter + flow) | Outcome | Presence |
+|---|---|---|---|
+| `OBSERVED_STATE present` | all TRUE | `MATCHED` | present |
+| `OBSERVED_STATE present` | any FALSE | `DIVERGED` | partial (something exists that may need undoing) |
+| `OBSERVED_STATE present` | any UNKNOWN (none FALSE) | `UNKNOWN` | present |
+| `OBSERVED_STATE partial` | — | `DIVERGED` | partial |
+| `OBSERVED_STATE absent` | — | `DIVERGED` | absent |
+| `UNCERTAIN` or not an observation | — | `UNKNOWN` | unknown |
+
+The comparison (with every postcondition's result) is stored on the node (`NodeRun.comparison`)
+and recorded in the evidence of the effect transition it caused.

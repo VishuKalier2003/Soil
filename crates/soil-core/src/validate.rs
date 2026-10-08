@@ -119,6 +119,10 @@ pub fn resolve_operation<'c>(
     Ok(Some((desc, op)))
 }
 
+fn is_template(v: &serde_json::Value) -> bool {
+    v.as_str().is_some_and(|s| s.contains("${"))
+}
+
 /// Effective action properties: node overrides, else adapter operation defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeTraits {
@@ -373,10 +377,30 @@ pub fn validate_flow(
                         format!("'{}' has effects; OBSERVE/VERIFY nodes must be read-only", op.name),
                     );
                 }
-                for p in &op.required_params {
+                for p in &op.input.required {
                     if n.params.get(p).is_none() {
                         c.report
                             .error("param-missing", &path, format!("operation '{}' requires param '{p}'", op.name));
+                    }
+                }
+                if let Some(params) = n.params.as_object() {
+                    for (key, value) in params {
+                        match op.input.fields.get(key) {
+                            None if !op.input.additional => c.report.warn(
+                                "param-unknown",
+                                &path,
+                                format!("operation '{}' does not declare param '{key}'", op.name),
+                            ),
+                            // Placeholders are checked at dispatch, once rendered.
+                            Some(f) if !is_template(value) && !value.is_null() && !f.ty.accepts(value) => {
+                                c.report.error(
+                                    "param-type",
+                                    &path,
+                                    format!("param '{key}' must be {:?}", f.ty).to_lowercase(),
+                                )
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 if n.resource.as_deref().is_none_or(|r| r.trim().is_empty()) {
@@ -551,13 +575,13 @@ pub fn validate_flow(
                     .node(target)
                     .and_then(|t| resolve_operation(spec, t, catalog).ok().flatten());
                 if let Some((_, top)) = target_op {
-                    if top.compensation.as_deref().is_some_and(|x| x != op.name) {
+                    if top.compensation.operation().is_some_and(|x| x != op.name) {
                         c.report.warn(
                             "compensation-operation",
                             &path,
                             format!(
                                 "adapter declares '{}' as the compensation of '{}', node uses '{}'",
-                                top.compensation.as_deref().unwrap_or_default(),
+                                top.compensation.operation().unwrap_or_default(),
                                 top.name,
                                 op.name
                             ),

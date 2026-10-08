@@ -10,6 +10,7 @@
 pub mod adapter;
 pub mod canonical;
 pub mod document;
+pub mod effect;
 pub mod evidence;
 pub mod expr;
 pub mod flow;

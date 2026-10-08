@@ -1,6 +1,9 @@
 //! Test fixtures: a fake adapter catalog and a small valid flow.
 
-use crate::adapter::{AdapterCatalog, AdapterDescriptor, OperationDescriptor};
+use crate::adapter::{
+    AdapterCatalog, AdapterDescriptor, CompensationCapability, OperationDescriptor, Schema,
+    SchemaType,
+};
 use crate::document::parse_flow;
 use crate::flow::FlowDocument;
 use crate::model::{
@@ -15,13 +18,18 @@ fn op(
     compensation: Option<&str>,
 ) -> OperationDescriptor {
     OperationDescriptor {
+        id: format!("fake.{name}@v1"),
         name: name.into(),
         description: String::new(),
-        read_only,
-        effect,
+        resource_type: "fake.thing".into(),
         resource_pattern: "fake://{thing}".into(),
-        required_params: vec![],
+        read_only,
+        input: Schema::open(),
+        output: Schema::open(),
+        effect,
+        effect_summary: String::new(),
         preconditions: vec![],
+        postconditions: vec![],
         idempotency: IdempotencyBehavior::Natural,
         reversibility,
         verification: if read_only {
@@ -29,8 +37,14 @@ fn op(
         } else {
             VerificationStrategy::ReadBack
         },
-        compensation: compensation.map(String::from),
         uncertainty: UncertaintySemantics::Reconcilable,
+        compensation: match compensation {
+            Some(c) => CompensationCapability::Operation {
+                operation: c.into(),
+                params: Default::default(),
+            },
+            None => CompensationCapability::None,
+        },
     }
 }
 
@@ -42,7 +56,7 @@ pub fn catalog() -> AdapterCatalog {
         Reversibility::Reversible,
         Some("thing.delete"),
     );
-    create.required_params = vec!["name".into()];
+    create.input = Schema::of(&[("name", SchemaType::String, true), ("color", SchemaType::String, false)]);
     create.idempotency = IdempotencyBehavior::Keyed;
     let mut mail = op("mail.send", false, EffectKind::External, Reversibility::Irreversible, None);
     mail.idempotency = IdempotencyBehavior::None;

@@ -11,7 +11,8 @@ use crate::providers::{
 };
 use crate::run::{FailureCause, Resolution, ResolutionOutcome, SkipReason, TransactionRun};
 use serde_json::{json, Map, Value};
-use soil_core::adapter::{Adapter, AdapterRegistry, ExecutionOutcome, Invocation, Observation};
+use soil_core::adapter::{Adapter, AdapterRegistry, AdapterResult, Invocation, UncertaintyCause};
+use soil_core::effect::{self, Comparison, EffectComparison, ExpectedEffect};
 use soil_core::canonical::sha256_hex;
 use soil_core::evidence::{redact, ChainError, EvidenceDraft};
 use soil_core::expr::{self, Truth};
@@ -175,12 +176,6 @@ enum Prepared {
 
 /// (violated, unknown and blocking, unknown but allowed by policy)
 type InvariantOutcome = (Vec<String>, Vec<String>, Vec<String>);
-
-enum Verdict {
-    Matched,
-    Diverged(Presence, String),
-    Unknown(String),
-}
 
 struct Exec<'e> {
     eng: &'e Engine<'e>,
@@ -651,7 +646,7 @@ impl<'e> Exec<'e> {
             }
         }
         // Adapter calls may overlap in time; their results are applied below in id order.
-        let outcomes: Vec<ExecutionOutcome> = if dispatch.len() <= 1 {
+        let outcomes: Vec<AdapterResult> = if dispatch.len() <= 1 {
             dispatch.iter().map(|(_, inv, a)| a.execute(inv)).collect()
         } else {
             std::thread::scope(|s| {
@@ -662,14 +657,17 @@ impl<'e> Exec<'e> {
                 handles
                     .into_iter()
                     .map(|h| {
-                        h.join().unwrap_or_else(|_| ExecutionOutcome::Ambiguous {
-                            reason: "adapter panicked during execution".into(),
+                        h.join().unwrap_or_else(|_| {
+                            AdapterResult::uncertain(
+                                UncertaintyCause::ProtocolViolation,
+                                "adapter panicked during execution",
+                            )
                         })
                     })
                     .collect()
             })
         };
-        let mut results: BTreeMap<String, Option<ExecutionOutcome>> =
+        let mut results: BTreeMap<String, Option<AdapterResult>> =
             inline.into_iter().map(|id| (id, None)).collect();
         for ((id, _, _), outcome) in dispatch.into_iter().zip(outcomes) {
             results.insert(id, Some(outcome));
@@ -721,6 +719,15 @@ impl<'e> Exec<'e> {
                 return Ok(Prepared::Stopped);
             }
         };
+
+        if let Some(op) = &node.operation {
+            let errors = op.input.validate(&params);
+            if !errors.is_empty() {
+                let reason = format!("params violate the input schema of {}: {}", op.id, errors.join("; "));
+                self.block(id, FailureClass::Failure, reason.clone(), json!({ "reason": reason }))?;
+                return Ok(Prepared::Stopped);
+            }
+        }
 
         let pre_ctx = self.node_ctx(id, Some(&params), None);
         let conditions: Vec<&String> = node
@@ -824,157 +831,139 @@ impl<'e> Exec<'e> {
             .and_then(|t| self.eng.adapters.get(t).cloned())
     }
 
-    fn observe(&mut self, id: &str) -> Observation {
+    /// Observes a dispatched node through its adapter; the contract is enforced (OBSERVED_STATE
+    /// or UNCERTAIN only, output schema respected).
+    fn observe(&mut self, id: &str) -> AdapterResult {
         let (Some(adapter), Some(inv)) = (self.adapter_for(id), self.invocations.get(id).cloned()) else {
-            return Observation::unknown("node was never dispatched");
+            return AdapterResult::uncertain(UncertaintyCause::Inconclusive, "node was never dispatched");
         };
         self.nrun(id).observations += 1;
-        adapter.observe(&inv)
+        adapter.observe(&inv).into_observation(self.node(id).operation.as_ref())
     }
 
-    fn complete_dispatch(&mut self, id: &str, outcome: ExecutionOutcome) -> Result<(), EngineError> {
-        self.nrun(id).outcome = Some(
-            match &outcome {
-                ExecutionOutcome::Applied { .. } => "applied".to_string(),
-                ExecutionOutcome::Rejected { reason } => format!("rejected: {reason}"),
-                ExecutionOutcome::TimedOut => "timed out".to_string(),
-                ExecutionOutcome::Ambiguous { reason } => format!("ambiguous: {reason}"),
-            },
-        );
-        let detail = json!({ "outcome": outcome });
-        if self.node(id).is_effectful() {
-            match outcome {
-                ExecutionOutcome::Applied { observed } => {
-                    self.act(id, ActionState::Observing, detail)?;
-                    self.eff(id, EffectState::Observing, json!({}))?;
-                    let obs = if self.node(id).verification == VerificationStrategy::ReadBack {
-                        self.observe(id)
-                    } else {
-                        Observation {
-                            presence: Presence::Present,
-                            state: observed,
-                        }
-                    };
-                    self.conclude(id, obs, FailureClass::Failure)
+    fn complete_dispatch(&mut self, id: &str, result: AdapterResult) -> Result<(), EngineError> {
+        let result = result.into_execution(self.node(id).operation.as_ref());
+        self.nrun(id).outcome = Some(match &result {
+            AdapterResult::Success { .. } => "SUCCESS".to_string(),
+            AdapterResult::Failure { reason } => format!("FAILURE: {reason}"),
+            AdapterResult::Uncertain { cause, detail } => format!("UNCERTAIN ({cause:?}): {detail}"),
+            AdapterResult::ObservedState { .. } => unreachable!("normalized away by into_execution"),
+        });
+        let detail = json!({ "outcome": result });
+        match result {
+            AdapterResult::Success { state } => {
+                self.act(id, ActionState::Observing, detail)?;
+                if !self.node(id).is_effectful() {
+                    self.finish_read(id, state)?;
+                    return self.reread(id);
                 }
-                ExecutionOutcome::Rejected { reason } => {
-                    let n = self.nrun(id);
+                self.eff(id, EffectState::Observing, json!({}))?;
+                let observation = if self.node(id).verification == VerificationStrategy::ReadBack {
+                    self.observe(id)
+                } else {
+                    // Without read-back the provider's confirmation is the observation.
+                    AdapterResult::observed(Presence::Present, state)
+                };
+                self.conclude(id, observation, FailureClass::Failure)
+            }
+            AdapterResult::Failure { reason } => {
+                let effectful = self.node(id).is_effectful();
+                let n = self.nrun(id);
+                if effectful {
                     n.presence = Some(Presence::Absent);
-                    n.failure_class = Some(FailureClass::Failure);
-                    n.reason = Some(reason);
-                    self.act(id, ActionState::Failed, detail)
                 }
-                ExecutionOutcome::TimedOut | ExecutionOutcome::Ambiguous { .. } => {
-                    let class = if matches!(outcome, ExecutionOutcome::TimedOut) {
-                        FailureClass::Timeout
-                    } else {
-                        FailureClass::Uncertain
-                    };
-                    {
-                        let n = self.nrun(id);
-                        n.failure_class = Some(class);
-                        n.reason = Some("outcome unknown; reconciling by observation".into());
-                    }
-                    self.act(id, ActionState::Uncertain, detail)?;
-                    self.eff(id, EffectState::Unknown, json!({ "reason": "no definitive answer from provider" }))?;
-                    self.reconcile(id, class)
-                }
+                n.failure_class = Some(FailureClass::Failure);
+                n.reason = Some(reason);
+                self.act(id, ActionState::Failed, detail)
             }
-        } else {
-            match outcome {
-                ExecutionOutcome::Applied { observed } => {
-                    self.act(id, ActionState::Observing, detail)?;
-                    self.finish_read(id, observed)?;
-                }
-                ExecutionOutcome::Rejected { reason } => {
+            AdapterResult::Uncertain { cause, .. } => {
+                // request timeout != confirmed failure: observe before anything else.
+                let class = if cause == UncertaintyCause::Timeout {
+                    FailureClass::Timeout
+                } else {
+                    FailureClass::Uncertain
+                };
+                {
                     let n = self.nrun(id);
-                    n.failure_class = Some(FailureClass::Failure);
-                    n.reason = Some(reason);
-                    self.act(id, ActionState::Failed, detail)?;
+                    n.failure_class = Some(class);
+                    n.reason = Some("outcome unknown; reconciling by observation".into());
                 }
-                ExecutionOutcome::TimedOut | ExecutionOutcome::Ambiguous { .. } => {
-                    self.nrun(id).failure_class = Some(FailureClass::Timeout);
-                    self.act(id, ActionState::Uncertain, detail)?;
+                self.act(id, ActionState::Uncertain, detail)?;
+                if !self.node(id).is_effectful() {
+                    return self.reread(id);
                 }
+                self.eff(id, EffectState::Unknown, json!({ "reason": "no definitive answer from provider" }))?;
+                self.reconcile(id, class)
             }
-            self.reread(id)
+            AdapterResult::ObservedState { .. } => unreachable!("normalized away by into_execution"),
         }
     }
 
-    /// Classifies an observation against the node's expected effect and postconditions.
-    fn classify(&self, id: &str, obs: &Observation) -> Verdict {
-        match obs.presence {
-            Presence::Unknown => Verdict::Unknown(
-                obs.state["reason"].as_str().unwrap_or("observation inconclusive").to_string(),
-            ),
-            Presence::Absent => Verdict::Diverged(Presence::Absent, "effect not present".into()),
-            Presence::Partial => Verdict::Diverged(Presence::Partial, "effect only partially applied".into()),
-            Presence::Present => {
-                let params = self.invocation_params(id);
-                let ctx = self.node_ctx(id, Some(&params), Some(&obs.state));
-                let results: Vec<(String, Truth)> = self
-                    .node(id)
-                    .spec
-                    .postconditions
-                    .iter()
-                    .map(|c| (c.clone(), expr::eval_str(c, &ctx)))
-                    .collect();
-                match Truth::all(results.iter().map(|r| r.1)) {
-                    Truth::True => Verdict::Matched,
-                    Truth::False => {
-                        let failed: Vec<&str> = results
-                            .iter()
-                            .filter(|r| r.1 == Truth::False)
-                            .map(|r| r.0.as_str())
-                            .collect();
-                        Verdict::Diverged(Presence::Partial, format!("postconditions false: {}", failed.join("; ")))
-                    }
-                    Truth::Unknown => Verdict::Unknown("postconditions evaluated UNKNOWN".into()),
-                }
-            }
-        }
+    /// EXPECTED (declared effect + adapter and flow postconditions) vs OBSERVED.
+    fn compare(&self, id: &str, observation: &AdapterResult) -> EffectComparison {
+        let node = self.node(id);
+        let expected = ExpectedEffect {
+            kind: node.effect,
+            summary: node
+                .operation
+                .as_ref()
+                .map(|o| o.effect_summary.clone())
+                .unwrap_or_default(),
+            postconditions: node
+                .operation
+                .iter()
+                .flat_map(|o| o.postconditions.iter())
+                .chain(node.spec.postconditions.iter())
+                .cloned()
+                .collect(),
+        };
+        let params = self.invocation_params(id);
+        effect::compare(&expected, observation, &self.node_ctx(id, Some(&params), None))
     }
 
     /// Applies an observation to an effectful node in OBSERVING (effect OBSERVING/RECONCILING).
-    fn conclude(&mut self, id: &str, obs: Observation, class: FailureClass) -> Result<(), EngineError> {
-        let verdict = self.classify(id, &obs);
-        let shown = json!({ "presence": obs.presence, "observed": obs.state });
-        match verdict {
-            Verdict::Matched => {
+    fn conclude(&mut self, id: &str, observation: AdapterResult, class: FailureClass) -> Result<(), EngineError> {
+        let cmp = self.compare(id, &observation);
+        let shown = json!({ "observation": observation, "comparison": cmp });
+        self.nrun(id).comparison = Some(cmp.clone());
+        match cmp.outcome {
+            Comparison::Matched => {
                 {
                     let n = self.nrun(id);
                     n.presence = Some(Presence::Present);
-                    n.observed = obs.state.clone();
+                    n.observed = cmp.observed.clone();
                     n.reason = None;
                     n.failure_class = None;
                     if n.verification.is_none() {
-                        n.verification = Some("read-back matched postconditions".into());
+                        n.verification = Some("observed effect MATCHED expectation".into());
                     }
                 }
-                self.run.facts.insert(id.to_string(), obs.state);
+                self.run.facts.insert(id.to_string(), cmp.observed);
                 self.eff(id, EffectState::Observed, shown)?;
                 self.eff(id, EffectState::Matched, json!({}))?;
                 self.act(id, ActionState::Verified, json!({}))?;
                 self.act(id, ActionState::Succeeded, json!({}))
             }
-            Verdict::Diverged(presence, reason) => {
-                let class = if presence == Presence::Absent { class } else { FailureClass::Failure };
+            Comparison::Diverged => {
+                // Confirmed absent after a timeout keeps the timeout class (it never happened);
+                // anything present-but-wrong is a failure with an effect to undo.
+                let class = if cmp.presence == Presence::Absent { class } else { FailureClass::Failure };
                 {
                     let n = self.nrun(id);
-                    n.presence = Some(presence);
-                    n.observed = obs.state.clone();
-                    n.reason = Some(reason.clone());
+                    n.presence = Some(cmp.presence);
+                    n.observed = cmp.observed.clone();
+                    n.reason = Some(cmp.reason.clone());
                     n.failure_class = Some(class);
                 }
-                self.run.facts.insert(id.to_string(), obs.state);
+                self.run.facts.insert(id.to_string(), cmp.observed.clone());
                 self.eff(id, EffectState::Observed, shown)?;
-                self.eff(id, EffectState::Diverged, json!({ "reason": reason }))?;
-                self.act(id, ActionState::Failed, json!({ "reason": reason }))
+                self.eff(id, EffectState::Diverged, json!({ "reason": cmp.reason }))?;
+                self.act(id, ActionState::Failed, json!({ "reason": cmp.reason }))
             }
-            Verdict::Unknown(reason) => {
+            Comparison::Unknown => {
                 self.nrun(id).presence = Some(Presence::Unknown);
-                self.eff(id, EffectState::Unknown, json!({ "reason": reason }))?;
-                self.act(id, ActionState::Uncertain, json!({ "reason": reason }))
+                self.eff(id, EffectState::Unknown, shown)?;
+                self.act(id, ActionState::Uncertain, json!({ "reason": cmp.reason }))
             }
         }
     }
@@ -989,8 +978,8 @@ impl<'e> Exec<'e> {
         for attempt in 1..=attempts {
             self.act(id, ActionState::Observing, json!({ "reconcileAttempt": attempt }))?;
             self.eff(id, EffectState::Reconciling, json!({ "reconcileAttempt": attempt }))?;
-            let obs = self.observe(id);
-            self.conclude(id, obs, class)?;
+            let observation = self.observe(id);
+            self.conclude(id, observation, class)?;
             if self.run.nodes[id].action != ActionState::Uncertain {
                 self.nrun(id).reconciled = true;
                 return Ok(());
@@ -1068,15 +1057,14 @@ impl<'e> Exec<'e> {
                 break;
             }
             self.act(id, ActionState::Observing, json!({ "reconcileAttempt": attempt }))?;
-            let obs = self.observe(id);
-            match obs.presence {
-                Presence::Present | Presence::Partial => self.finish_read(id, obs.state)?,
-                Presence::Absent => {
+            match self.observe(id) {
+                AdapterResult::ObservedState { presence: Presence::Absent, .. } => {
                     self.nrun(id).reason = Some("resource not found".into());
                     self.act(id, ActionState::Failed, json!({ "reason": "resource not found" }))?;
                 }
-                Presence::Unknown => {
-                    self.act(id, ActionState::Uncertain, json!({ "observed": obs.state }))?;
+                AdapterResult::ObservedState { state, .. } => self.finish_read(id, state)?,
+                other => {
+                    self.act(id, ActionState::Uncertain, json!({ "observation": other }))?;
                 }
             }
         }
@@ -1438,14 +1426,15 @@ impl<'e> Exec<'e> {
                 self.act(target, ActionState::Compensated, json!({ "compensator": comp }))?;
             } else if self.run.nodes[target].action == ActionState::Compensating {
                 let obs = self.observe_for_discovery(target);
-                let detail = json!({ "presence": obs.presence, "observed": obs.state });
-                match self.classify(target, &obs) {
-                    Verdict::Unknown(_) => self.eff(target, EffectState::Unknown, detail)?,
-                    Verdict::Matched => {
+                let cmp = self.compare(target, &obs);
+                let detail = json!({ "observation": obs, "comparison": cmp });
+                match cmp.outcome {
+                    Comparison::Unknown => self.eff(target, EffectState::Unknown, detail)?,
+                    Comparison::Matched => {
                         self.eff(target, EffectState::Observed, detail)?;
                         self.eff(target, EffectState::Matched, json!({}))?;
                     }
-                    Verdict::Diverged(..) => {
+                    Comparison::Diverged => {
                         self.eff(target, EffectState::Observed, detail)?;
                         self.eff(target, EffectState::Diverged, json!({}))?;
                     }
@@ -1499,9 +1488,12 @@ impl<'e> Exec<'e> {
             .any(|(d, _)| matches!(self.dep_status(d), DepStatus::Failed))
     }
 
-    fn observe_for_discovery(&mut self, id: &str) -> Observation {
+    fn observe_for_discovery(&mut self, id: &str) -> AdapterResult {
         let obs = self.observe(id);
-        self.nrun(id).discovered = Some(obs.state.clone());
+        self.nrun(id).discovered = Some(match &obs {
+            AdapterResult::ObservedState { state, .. } => state.clone(),
+            other => json!(other),
+        });
         obs
     }
 
@@ -1525,14 +1517,14 @@ impl<'e> Exec<'e> {
             return Ok(self.run.nodes[id].presence.unwrap_or(Presence::Unknown));
         }
         let obs = self.observe_for_discovery(id);
-        let presence = match self.classify(id, &obs) {
-            Verdict::Matched => Presence::Present,
-            Verdict::Diverged(p, _) => p,
-            Verdict::Unknown(_) => Presence::Unknown,
+        let cmp = self.compare(id, &obs);
+        let presence = match cmp.outcome {
+            Comparison::Unknown => Presence::Unknown,
+            _ => cmp.presence,
         };
         if effect == Some(EffectState::NotObserved) {
             // Rejected by the provider, yet discovery may still find an effect.
-            let detail = json!({ "presence": obs.presence, "observed": obs.state, "phase": "recovery discovery" });
+            let detail = json!({ "observation": obs, "comparison": cmp, "phase": "recovery discovery" });
             self.eff(id, EffectState::Observing, json!({}))?;
             match presence {
                 Presence::Unknown => self.eff(id, EffectState::Unknown, detail)?,

@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soil_core::adapter::Invocation;
+use soil_core::effect::EffectComparison;
 use soil_core::evidence::EvidenceChain;
 use soil_core::expr::Truth;
 use soil_core::flow::{NodeKind, Phase};
@@ -52,6 +53,9 @@ pub struct NodeRun {
     pub observed: Value,
     /// State observed during recovery discovery.
     pub discovered: Option<Value>,
+    /// Latest EXPECTED vs OBSERVED comparison of this node's effect.
+    #[serde(default)]
+    pub comparison: Option<EffectComparison>,
     pub outcome: Option<String>,
     pub verification: Option<String>,
     pub reason: Option<String>,
@@ -143,6 +147,7 @@ impl TransactionRun {
                         invocation: None,
                         observed: Value::Null,
                         discovered: None,
+                        comparison: None,
                         outcome: None,
                         verification: None,
                         reason: None,

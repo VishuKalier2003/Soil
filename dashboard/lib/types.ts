@@ -119,19 +119,56 @@ export interface Report {
   warnings: Issue[];
 }
 
+export interface FieldSchema {
+  type: "string" | "number" | "integer" | "boolean" | "object" | "array" | "any";
+  nullable?: boolean;
+  description?: string;
+}
+
+export interface Schema {
+  fields: Record<string, FieldSchema>;
+  required: string[];
+  additional: boolean;
+}
+
+export type CompensationCapability =
+  | { kind: "none" }
+  | { kind: "operation"; operation: string; params: Record<string, string> };
+
 export interface OperationDescriptor {
+  id: string;
   name: string;
   description: string;
-  readOnly: boolean;
-  effect: EffectKind;
+  resourceType: string;
   resourcePattern: string;
-  requiredParams: string[];
+  readOnly: boolean;
+  input: Schema;
+  output: Schema;
+  effect: EffectKind;
+  effectSummary: string;
   preconditions: string[];
+  postconditions: string[];
   idempotency: Idempotency;
   reversibility: Reversibility;
   verification: Verification;
-  compensation?: string;
   uncertainty: Uncertainty;
+  compensation: CompensationCapability;
+}
+
+/** Normalized adapter result (SUCCESS | FAILURE | UNCERTAIN | OBSERVED_STATE). */
+export type AdapterResult =
+  | { kind: "SUCCESS"; state: unknown }
+  | { kind: "FAILURE"; reason: string }
+  | { kind: "UNCERTAIN"; cause: string; detail: string }
+  | { kind: "OBSERVED_STATE"; presence: Presence; state: unknown };
+
+/** EXPECTED vs OBSERVED. */
+export interface EffectComparison {
+  outcome: "MATCHED" | "DIVERGED" | "UNKNOWN";
+  presence: Presence;
+  postconditions: { expr: string; result: "true" | "false" | "unknown" }[];
+  observed: unknown;
+  reason: string;
 }
 
 export interface AdapterDescriptor {
@@ -201,6 +238,7 @@ export interface NodeRun {
   observed?: unknown;
   discovered?: unknown;
   outcome?: string | null;
+  comparison?: EffectComparison | null;
   verification?: string | null;
   reason?: string | null;
   failureClass?: string | null;

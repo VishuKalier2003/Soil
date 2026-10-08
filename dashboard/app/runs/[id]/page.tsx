@@ -222,6 +222,24 @@ function Inspector() {
                       ]}
                     />
                   </Section>
+                  {nodeRun?.comparison ? (
+                    <Section title="Expected vs observed">
+                      <KeyValue
+                        rows={[
+                          ["comparison", <Badge key="c" state={nodeRun.comparison.outcome === "MATCHED" ? "SATISFIED" : nodeRun.comparison.outcome === "DIVERGED" ? "VIOLATED" : "UNPROVABLE"} label={nodeRun.comparison.outcome} />],
+                          ["presence", nodeRun.comparison.presence],
+                          ["reason", nodeRun.comparison.reason],
+                        ]}
+                      />
+                      <ul className="plain mono small">
+                        {nodeRun.comparison.postconditions.map((p, i) => (
+                          <li key={i} style={{ color: p.result === "true" ? "var(--ok)" : p.result === "false" ? "var(--bad)" : "var(--warn)" }}>
+                            {p.result.toUpperCase()} · {p.expr}
+                          </li>
+                        ))}
+                      </ul>
+                    </Section>
+                  ) : null}
                   {nodeRun?.invocation ? (
                     <Section title="Invocation (redacted)">
                       <div className="mono small">{nodeRun.invocation.resource}</div>

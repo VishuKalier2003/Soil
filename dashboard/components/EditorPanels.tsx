@@ -199,10 +199,23 @@ export function NodeInspector({
                 <span>idempotency {traits.op.idempotency}</span>
                 <span>verify {traits.op.verification}</span>
                 <span>{traits.op.uncertainty}</span>
-                {traits.op.compensation ? <span>compensation: {traits.op.compensation}</span> : null}
+                {traits.op.compensation.kind === "operation" ? <span>compensation: {traits.op.compensation.operation}</span> : null}
               </div>
-              {traits.op.requiredParams.length ? (
-                <div className="muted small">required params: {traits.op.requiredParams.join(", ")}</div>
+              <div className="muted small mono">
+                {traits.op.id} · {traits.op.resourceType}
+              </div>
+              <div className="muted small">expected effect: {traits.op.effectSummary}</div>
+              {Object.keys(traits.op.input.fields).length ? (
+                <div className="muted small mono">
+                  in {"{"}
+                  {Object.entries(traits.op.input.fields)
+                    .map(([k, f]) => `${k}${traits.op!.input.required.includes(k) ? "" : "?"}: ${f.type}`)
+                    .join(", ")}
+                  {"}"}
+                </div>
+              ) : null}
+              {traits.op.postconditions.length ? (
+                <div className="muted small mono">post: {traits.op.postconditions.join(" && ")}</div>
               ) : null}
             </div>
           ) : null}
