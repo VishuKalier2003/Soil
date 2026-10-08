@@ -1,0 +1,18 @@
+apiVersion: soil.dev/v1alpha1
+kind: SimScenario
+metadata:
+  name: partial-traffic-shift
+spec:
+  description: "Traffic only shifts halfway. Soil detects the divergence, observes actual state and runs the declared compensations."
+  expect: RECOVERED
+  faults: {shift_traffic: partial}
+  inputs: {incident: INC-4521, image: "ghcr.io/acme/checkout:1.41.1"}
+  world:
+    repos:
+      acme/checkout: {defaultBranch: main, headSha: 9f1c2ab}
+    deployments:
+      prod-eu/checkout/api: {image: "ghcr.io/acme/checkout:1.41.0", configVersion: cfg-17, replicas: 3}
+    traffic:
+      prod-eu/checkout/api: {canary: 0}
+    http:
+      "https://slo.internal/api/v1/slo/checkout": {error_rate: 0.002, p99_ms: 182}

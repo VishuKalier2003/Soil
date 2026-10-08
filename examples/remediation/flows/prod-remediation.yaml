@@ -1,0 +1,330 @@
+# Autonomous production software remediation.
+#
+# Forward:  inspect repo → modify code → run tests → open PR → run CI → checkpoint
+#           → approval → deploy → shift traffic → verify SLO → COMMIT
+# Recovery: observe actual state → restore traffic → roll back deployment
+#           → restore configuration (if it changed) → verify recovery
+#           (in parallel: close the PR → delete the branch)
+#
+# Every compensation is declared here, before execution. Soil never invents one.
+apiVersion: soil.dev/v1alpha1
+kind: Flow
+metadata:
+  name: prod-remediation
+  description: Patch, test, ship and verify a production fix; roll back on failure.
+  labels:
+    team: payments
+    service: checkout
+spec:
+  intent:
+    summary: "Remediate ${inputs.incident} on ${inputs.service} by shipping ${inputs.image}"
+    actor: agent:remediator
+    principal: team:payments
+    inputs:
+      incident: {required: true, description: Incident being remediated}
+      image: {required: true, description: Image containing the fix}
+      service: {default: checkout}
+      branch: {default: soil/remediation}
+      config_version: {default: cfg-18, description: Config version shipped with the fix}
+      max_error_rate: {default: 0.01, description: SLO error budget for the commit invariant}
+
+  authority:
+    provider: crane
+    reference: crane://grants/payments/remediation-prod
+
+  policies: [prod-safety]
+
+  guarantees:
+    require: [compensatable, verified, reconcilable]
+
+  adapters:
+    github: {ref: github-acme}
+    k8s: {ref: k8s-prod-eu}
+    ci: {type: ci, version: 1, config: {provider: generic}}
+    slo: {type: http, version: 1}
+
+  execution:
+    maxParallelism: 4
+
+  nodes:
+    # ---------------------------------------------------------------- forward
+    - id: inspect_repo
+      kind: OBSERVE
+      label: Inspect repository
+      intent: Read the repository state the patch will be based on
+      adapter: github
+      operation: repo.inspect
+      resource: github://acme/checkout
+      ui: {x: 0, y: 0}
+
+    - id: observe_baseline
+      kind: OBSERVE
+      label: Observe baseline
+      intent: Record the production state recovery must restore
+      adapter: k8s
+      operation: deployment.status
+      resource: k8s://prod-eu/checkout/deployment/api
+      ui: {x: 0, y: 240}
+
+    - id: modify_code
+      kind: ACTION
+      label: Modify code
+      intent: Commit the remediation patch on a new branch
+      adapter: github
+      operation: branch.commit
+      resource: "github://acme/checkout/branches/${inputs.branch}"
+      preconditions:
+        - 'facts.inspect_repo.default_branch == "main"'
+        - "facts.inspect_repo.archived == false"
+      params:
+        branch: "${inputs.branch}"
+        base: "${facts.inspect_repo.head_sha}"
+        message: "fix(${inputs.service}): remediate ${inputs.incident}"
+        files:
+          deploy/image.txt: "${inputs.image}"
+          deploy/config-version.txt: "${inputs.config_version}"
+        token: {secretRef: env:GITHUB_TOKEN}
+      expectedEffect: {kind: create, summary: Branch with one remediation commit}
+      postconditions:
+        - "observed.base == facts.inspect_repo.head_sha"
+      idempotency: {behavior: keyed, key: "remediation-${inputs.incident}-commit"}
+      risk: medium
+      ui: {x: 230, y: 0}
+
+    - id: run_tests
+      kind: ACTION
+      label: Run tests
+      adapter: ci
+      operation: job.run
+      resource: "ci://generic/unit-tests/${inputs.branch}"
+      params: {job: unit-tests, ref: "${facts.modify_code.sha}"}
+      postconditions:
+        - 'observed.status == "passed"'
+        - "observed.tests_failed == 0"
+      risk: low
+      ui: {x: 460, y: 0}
+
+    - id: create_pr
+      kind: ACTION
+      label: Open pull request
+      adapter: github
+      operation: pull_request.create
+      resource: "github://acme/checkout/pulls/${inputs.branch}"
+      params:
+        head: "${inputs.branch}"
+        base: main
+        title: "Remediate ${inputs.incident}"
+      postconditions:
+        - 'observed.state == "open"'
+      risk: medium
+      ui: {x: 690, y: 0}
+
+    - id: run_ci
+      kind: ACTION
+      label: Run CI pipeline
+      adapter: ci
+      operation: pipeline.run
+      resource: "ci://generic/checkout-main/${inputs.branch}"
+      params: {ref: "${facts.modify_code.sha}"}
+      postconditions:
+        - 'observed.status == "passed"'
+      risk: low
+      ui: {x: 920, y: 0}
+
+    - id: pre_deploy
+      kind: CHECKPOINT
+      label: Pre-deploy checkpoint
+      ui: {x: 230, y: 240}
+
+    - id: approve_deploy
+      kind: APPROVAL
+      label: Approve production deploy
+      intent: Crane approval for a high-risk production change
+      risk: high
+      ui: {x: 460, y: 240}
+
+    - id: deploy
+      kind: ACTION
+      label: Deploy
+      intent: Roll out the fixed image and config to production
+      adapter: k8s
+      operation: deployment.rollout
+      resource: k8s://prod-eu/checkout/deployment/api
+      params:
+        image: "${inputs.image}"
+        config_version: "${inputs.config_version}"
+      postconditions:
+        - "observed.image == params.image"
+        - "observed.ready == true"
+      risk: high
+      timeoutMs: 120000
+      ui: {x: 690, y: 240}
+
+    - id: shift_traffic
+      kind: ACTION
+      label: Shift traffic
+      adapter: k8s
+      operation: traffic.shift
+      resource: k8s://prod-eu/checkout/traffic/api
+      params: {canary_weight: 100}
+      postconditions:
+        - "observed.canary == 100"
+      risk: high
+      ui: {x: 920, y: 240}
+
+    - id: verify_slo
+      kind: VERIFY
+      label: Verify SLO
+      adapter: slo
+      operation: get
+      resource: "https://slo.internal/api/v1/slo/${inputs.service}"
+      checks:
+        - "observed.error_rate < inputs.max_error_rate"
+        - "observed.p99_ms < 300"
+      ui: {x: 1150, y: 240}
+
+    # ---------------------------------------------------------------- recovery
+    - id: observe_actual
+      kind: OBSERVE
+      phase: recovery
+      label: Observe actual state
+      adapter: k8s
+      operation: deployment.status
+      resource: k8s://prod-eu/checkout/deployment/api
+      ui: {x: 0, y: 560}
+
+    - id: restore_traffic
+      kind: COMPENSATE
+      phase: recovery
+      label: Restore traffic
+      adapter: k8s
+      operation: traffic.restore
+      resource: k8s://prod-eu/checkout/traffic/api
+      params: {canary_weight: "${target.observed.previous_canary}"}
+      postconditions:
+        - "observed.canary == params.canary_weight"
+      ui: {x: 230, y: 500}
+
+    - id: rollback_deploy
+      kind: COMPENSATE
+      phase: recovery
+      label: Roll back deployment
+      adapter: k8s
+      operation: deployment.rollback
+      resource: k8s://prod-eu/checkout/deployment/api
+      params: {image: "${target.observed.previous_image}"}
+      postconditions:
+        - "observed.image == facts.observe_baseline.image"
+      ui: {x: 460, y: 500}
+
+    - id: config_changed
+      kind: CONDITION
+      phase: recovery
+      label: Config changed?
+      expr: "facts.observe_actual.config_version != facts.observe_baseline.config_version"
+      ui: {x: 690, y: 500}
+
+    - id: restore_config
+      kind: ACTION
+      phase: recovery
+      label: Restore configuration
+      adapter: k8s
+      operation: config.restore
+      resource: k8s://prod-eu/checkout/deployment/api
+      params: {config_version: "${facts.observe_baseline.config_version}"}
+      postconditions:
+        - "observed.config_version == params.config_version"
+      ui: {x: 920, y: 500}
+
+    - id: verify_recovery
+      kind: VERIFY
+      phase: recovery
+      label: Verify recovery
+      adapter: k8s
+      operation: deployment.status
+      resource: k8s://prod-eu/checkout/deployment/api
+      checks:
+        - "observed.image == facts.observe_baseline.image"
+        - "observed.config_version == facts.observe_baseline.config_version"
+        - "observed.traffic.canary == facts.observe_baseline.traffic.canary"
+      ui: {x: 1150, y: 500}
+
+    - id: close_pr
+      kind: COMPENSATE
+      phase: recovery
+      label: Close pull request
+      adapter: github
+      operation: pull_request.close
+      resource: "github://acme/checkout/pulls/${inputs.branch}"
+      params: {number: "${target.observed.number}"}
+      ui: {x: 230, y: 660}
+
+    - id: delete_branch
+      kind: COMPENSATE
+      phase: recovery
+      label: Delete branch
+      adapter: github
+      operation: branch.delete
+      resource: "github://acme/checkout/branches/${inputs.branch}"
+      params: {branch: "${target.params.branch}"}
+      ui: {x: 460, y: 660}
+
+  edges:
+    # forward ordering
+    - {from: inspect_repo, to: modify_code, type: DEPENDS_ON}
+    - {from: modify_code, to: run_tests, type: ON_SUCCESS}
+    - {from: run_tests, to: create_pr, type: ON_SUCCESS}
+    - {from: create_pr, to: run_ci, type: ON_SUCCESS}
+    - {from: run_ci, to: pre_deploy, type: DEPENDS_ON}
+    - {from: observe_baseline, to: pre_deploy, type: DEPENDS_ON}
+    - {from: pre_deploy, to: approve_deploy, type: DEPENDS_ON}
+    - {from: approve_deploy, to: deploy, type: DEPENDS_ON}
+    - {from: deploy, to: shift_traffic, type: ON_SUCCESS}
+    - {from: verify_slo, to: deploy, type: VERIFIES}
+    - {from: verify_slo, to: shift_traffic, type: VERIFIES}
+
+    # recovery triggers (forward → recovery)
+    - {from: modify_code, to: observe_actual, type: ON_FAILURE}
+    - {from: run_tests, to: observe_actual, type: ON_FAILURE}
+    - {from: create_pr, to: observe_actual, type: ON_FAILURE}
+    - {from: run_ci, to: observe_actual, type: ON_FAILURE}
+    - {from: pre_deploy, to: observe_actual, type: ON_FAILURE}
+    - {from: approve_deploy, to: observe_actual, type: ON_FAILURE}
+    - {from: deploy, to: observe_actual, type: ON_FAILURE}
+    - {from: deploy, to: observe_actual, type: ON_TIMEOUT}
+    - {from: deploy, to: observe_actual, type: ON_UNCERTAIN}
+    - {from: shift_traffic, to: observe_actual, type: ON_FAILURE}
+    - {from: shift_traffic, to: observe_actual, type: ON_UNCERTAIN}
+    - {from: verify_slo, to: observe_actual, type: ON_FAILURE}
+
+    # recovery ordering
+    - {from: observe_actual, to: restore_traffic, type: DEPENDS_ON}
+    - {from: restore_traffic, to: rollback_deploy, type: DEPENDS_ON}
+    - {from: rollback_deploy, to: config_changed, type: DEPENDS_ON}
+    - {from: config_changed, to: restore_config, type: GUARDS}
+    - {from: rollback_deploy, to: verify_recovery, type: DEPENDS_ON}
+    - {from: restore_config, to: verify_recovery, type: TRIGGERS}
+    - {from: observe_actual, to: close_pr, type: DEPENDS_ON}
+    - {from: close_pr, to: delete_branch, type: DEPENDS_ON}
+
+    # compensation semantics (declared before execution)
+    - {from: restore_traffic, to: shift_traffic, type: COMPENSATES}
+    - {from: rollback_deploy, to: deploy, type: COMPENSATES}
+    - {from: close_pr, to: create_pr, type: COMPENSATES}
+    - {from: delete_branch, to: modify_code, type: COMPENSATES}
+
+  invariants:
+    - id: tests_green
+      description: Tests and CI passed for the commit being deployed
+      scope: checkpoint:pre_deploy
+      expr: 'facts.run_tests.status == "passed" && facts.run_ci.status == "passed"'
+    - id: full_rollout
+      description: The fix is live and receives all traffic
+      expr: "facts.deploy.image == inputs.image && facts.shift_traffic.canary == 100"
+    - id: slo_budget
+      description: Error rate is within budget after the change
+      expr: "facts.verify_slo.error_rate < inputs.max_error_rate"
+
+  commit:
+    requires: [verify_slo]
+    onViolation: [observe_actual]

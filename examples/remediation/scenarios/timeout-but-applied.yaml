@@ -1,0 +1,18 @@
+apiVersion: soil.dev/v1alpha1
+kind: SimScenario
+metadata:
+  name: timeout-but-applied
+spec:
+  description: "The rollout request times out but was actually applied. Soil reconciles by observation instead of failing or retrying, then commits."
+  expect: COMMITTED
+  faults: {deploy: timeout_after_apply}
+  inputs: {incident: INC-4521, image: "ghcr.io/acme/checkout:1.41.1"}
+  world:
+    repos:
+      acme/checkout: {defaultBranch: main, headSha: 9f1c2ab}
+    deployments:
+      prod-eu/checkout/api: {image: "ghcr.io/acme/checkout:1.41.0", configVersion: cfg-17, replicas: 3}
+    traffic:
+      prod-eu/checkout/api: {canary: 0}
+    http:
+      "https://slo.internal/api/v1/slo/checkout": {error_rate: 0.002, p99_ms: 182}

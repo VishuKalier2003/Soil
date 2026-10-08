@@ -1,0 +1,6 @@
+/target
+.soil/
+node_modules/
+.next/
+dashboard/out/
+*.log

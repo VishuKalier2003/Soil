@@ -1,0 +1,18 @@
+apiVersion: soil.dev/v1alpha1
+kind: SimScenario
+metadata:
+  name: compensation-fails
+spec:
+  description: "The SLO check fails and the rollback is rejected. Soil reports a partial recovery instead of pretending success."
+  expect: PARTIALLY_RECOVERED
+  faults: {rollback_deploy: reject}
+  inputs: {incident: INC-4521, image: "ghcr.io/acme/checkout:1.41.1"}
+  world:
+    repos:
+      acme/checkout: {defaultBranch: main, headSha: 9f1c2ab}
+    deployments:
+      prod-eu/checkout/api: {image: "ghcr.io/acme/checkout:1.41.0", configVersion: cfg-17, replicas: 3}
+    traffic:
+      prod-eu/checkout/api: {canary: 0}
+    http:
+      "https://slo.internal/api/v1/slo/checkout": {error_rate: 0.042, p99_ms: 611}

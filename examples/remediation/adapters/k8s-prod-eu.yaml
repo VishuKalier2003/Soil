@@ -1,0 +1,10 @@
+apiVersion: soil.dev/v1alpha1
+kind: AdapterConfig
+metadata:
+  name: k8s-prod-eu
+spec:
+  type: kubernetes
+  version: 1
+  config:
+    cluster: prod-eu
+    kubeconfig: {secretRef: file:/var/run/soil/kubeconfig-prod-eu}

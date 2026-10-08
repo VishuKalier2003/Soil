@@ -1,0 +1,10 @@
+apiVersion: soil.dev/v1alpha1
+kind: AdapterConfig
+metadata:
+  name: github-acme
+spec:
+  type: github
+  version: 1
+  config:
+    organization: acme
+    auth: {secretRef: env:GITHUB_TOKEN}

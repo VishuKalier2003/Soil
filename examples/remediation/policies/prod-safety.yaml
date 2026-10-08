@@ -1,0 +1,11 @@
+apiVersion: soil.dev/v1alpha1
+kind: Policy
+metadata:
+  name: prod-safety
+  description: Conservative execution policy for production changes.
+spec:
+  allowUncertainty: false
+  allowIrreversible: false
+  requireVerificationAtOrAbove: medium
+  requireApprovalAtOrAbove: high
+  maxReconcileAttempts: 3

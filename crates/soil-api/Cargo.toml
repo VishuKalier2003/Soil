@@ -1,0 +1,25 @@
+[package]
+name = "soil-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "soil-api"
+path = "src/main.rs"
+
+[dependencies]
+soil-core.workspace = true
+soil-adapters.workspace = true
+soil-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+tower-http.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
