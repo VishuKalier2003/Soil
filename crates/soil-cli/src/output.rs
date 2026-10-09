@@ -83,6 +83,21 @@ pub fn print_summary(run: &TransactionRun, expect: Option<&str>) {
             f.reason
         );
     }
+    if !run.awaiting.is_empty() {
+        let approve: Vec<String> = run.awaiting.iter().map(|a| format!("--approve {a}")).collect();
+        println!("  paused    waiting for approval of {:?}", run.awaiting);
+        println!("            continue: soil transaction resume {} {}", run.id, approve.join(" "));
+    }
+    if let Some(p) = &run.pins {
+        println!(
+            "  sealed    flow {}  policy {}  authority {}  actions {}  recovery {}",
+            p.flow,
+            &p.policy_hash[..12],
+            &p.authority_hash[..12],
+            &p.action_graph_hash[..12],
+            &p.recovery_graph_hash[..12]
+        );
+    }
     let reconciled: Vec<&String> = run.nodes.iter().filter(|(_, n)| n.reconciled).map(|(id, _)| id).collect();
     if !reconciled.is_empty() {
         println!("  reconciled after uncertainty: {reconciled:?}");
@@ -108,8 +123,11 @@ pub fn print_status(run: &TransactionRun) {
     println!("  state     {}", run.state);
     println!("  recovery  {}", run.recovery.state);
     println!("  guarantee {}", run.guarantee.state);
+    if !run.awaiting.is_empty() {
+        println!("  paused    waiting for approval of {:?}", run.awaiting);
+    }
     if let Some(a) = &run.authority {
-        println!("  authority {} {} ({})", a.provider, a.reference, a.decision_ref);
+        println!("  authority {} contract {} {} ({})", a.provider, a.contract_id, a.contract_hash, a.decision_ref);
     }
     println!();
     println!(
@@ -132,8 +150,14 @@ pub fn print_status(run: &TransactionRun) {
         if let Some(r) = &n.reason {
             notes.push(r.clone());
         }
-        if let Some(v) = &n.verification {
+        if let Some(v) = n.verification.as_ref().filter(|v| Some(*v) != n.reason.as_ref()) {
             notes.push(v.clone());
+        }
+        if n.dispatched > 1 {
+            notes.push(format!("dispatched {}x", n.dispatched));
+        }
+        if let Some(sub) = &n.subrun {
+            notes.push(format!("subtransaction {} {}", sub.id, sub.state));
         }
         println!(
             "  {:<17} {:<10} {:<8} {:<21} {:<13} {:<8} {}",
@@ -154,10 +178,22 @@ pub fn print_status(run: &TransactionRun) {
     }
     if !run.recovery.plan.is_empty() || !run.recovery.classification.is_empty() {
         println!();
-        println!("  recovery classification {:?}", run.recovery.classification);
-        println!("  recovery plan           {:?}", run.recovery.plan);
-        if !run.recovery.uncovered.is_empty() {
-            println!("  uncovered               {:?}", run.recovery.uncovered);
+        let r = &run.recovery;
+        println!("  recovery classification {:?}", r.classification);
+        if !r.divergence.is_empty() {
+            println!("  divergence              {:?}", r.divergence);
+        }
+        println!("  recovery plan           {:?}", r.plan);
+        for (label, list) in [
+            ("restored (verified)", &r.restored),
+            ("retained", &r.retained),
+            ("manual", &r.manual),
+            ("uncovered", &r.uncovered),
+            ("residual", &r.residual),
+        ] {
+            if !list.is_empty() {
+                println!("  {label:<23} {list:?}");
+            }
         }
     }
 }
@@ -198,7 +234,14 @@ pub fn print_plan(plan: &TransactionPlan) {
     println!("  flow        {}", plan.flow);
     println!("  intent      {}", plan.intent.summary);
     println!("  inputs      {}", serde_json::to_string(&plan.intent.inputs).unwrap_or_default());
-    println!("  authority   {} {}", plan.authority.provider, plan.authority.reference);
+    println!(
+        "  authority   {} contract {} {}",
+        plan.authority.provider, plan.authority.contract_id, plan.authority.contract_hash
+    );
+    let c = &plan.policy.spec.constraints;
+    if !c.is_empty() {
+        println!("  constraints {}", serde_json::to_string(c).unwrap_or_default());
+    }
     println!("  policies    {:?}", plan.policy.refs);
     println!("  adapters    {:?}", plan.adapters);
     println!("  max risk    {:?}", plan.max_risk);

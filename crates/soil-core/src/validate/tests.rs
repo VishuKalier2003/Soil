@@ -228,6 +228,37 @@ fn commit_boundary_must_reference_forward_nodes() {
 }
 
 #[test]
+fn aliases_and_policy_parameters_are_expression_roots() {
+    let mut doc = flow();
+    doc.spec.aliases.insert("thing".into(), "facts.make".into());
+    doc.spec.invariants.push(crate::flow::InvariantSpec {
+        id: "allowed".into(),
+        description: None,
+        expr: "thing.name in allowed_names".into(),
+        scope: "always".into(),
+        severity: Default::default(),
+        on_unknown: Default::default(),
+    });
+    // `allowed_names` is unknown until a policy provides it.
+    assert!(check(&doc).has_error("expr-root"));
+    let mut policy = EffectivePolicy::default();
+    policy
+        .spec
+        .parameters
+        .insert("allowed_names".into(), serde_json::json!(["widget"]));
+    let r = validate_flow(&doc, &catalog(), &policy);
+    assert!(r.is_ok(), "{r}");
+
+    // Aliases may not shadow reserved names, point nowhere, or chain.
+    doc.spec.aliases.insert("facts".into(), "facts.make".into());
+    doc.spec.aliases.insert("ghost".into(), "facts.nope".into());
+    doc.spec.aliases.insert("chained".into(), "thing.name".into());
+    let r = validate_flow(&doc, &catalog(), &policy);
+    assert_eq!(r.errors.iter().filter(|e| e.code == "alias").count(), 2, "{r}");
+    assert!(r.has_error("unknown-fact"), "{r}");
+}
+
+#[test]
 fn input_schema_is_checked_statically() {
     let mut doc = flow();
     doc.spec.nodes[1].params["color"] = serde_json::json!(7);

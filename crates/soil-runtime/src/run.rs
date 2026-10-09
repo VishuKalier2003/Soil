@@ -4,10 +4,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soil_core::adapter::Invocation;
-use soil_core::effect::EffectComparison;
+use soil_core::constraints::ConstraintCheck;
+use soil_core::effect::{Divergence, EffectComparison};
 use soil_core::evidence::EvidenceChain;
 use soil_core::expr::Truth;
-use soil_core::flow::{NodeKind, Phase};
+use soil_core::flow::{NodeKind, Phase, Severity};
 use soil_core::guarantee::GuaranteeProfile;
 use soil_core::model::{FailureClass, Presence};
 use soil_core::plan::TransactionPlan;
@@ -15,7 +16,7 @@ use soil_core::state::{
     ActionState, EffectState, GuaranteeState, InvariantState, RecoveryState, State,
     TransactionState,
 };
-use soil_core::transaction::{AuthorityRecord, FlowRef};
+use soil_core::transaction::{AuthorityRecord, FlowRef, SealPins};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +57,12 @@ pub struct NodeRun {
     /// Latest EXPECTED vs OBSERVED comparison of this node's effect.
     #[serde(default)]
     pub comparison: Option<EffectComparison>,
+    /// The nested transaction of a compensation flow (COMPENSATE nodes with `flow`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subrun: Option<Box<TransactionRun>>,
+    /// Transaction constraints checked before dispatch (replicas, region, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<ConstraintCheck>,
     pub outcome: Option<String>,
     pub verification: Option<String>,
     pub reason: Option<String>,
@@ -67,6 +74,8 @@ pub struct NodeRun {
 pub struct InvariantRun {
     pub state: InvariantState,
     pub scope: String,
+    #[serde(default)]
+    pub severity: Severity,
     pub expr: String,
     pub last: Option<Truth>,
 }
@@ -102,6 +111,18 @@ pub struct RecoveryRun {
     pub uncovered: Vec<String>,
     /// Irreversible effects left in place.
     pub residual: Vec<String>,
+    /// How each discovered effect diverges from what the action intended.
+    #[serde(default)]
+    pub divergence: BTreeMap<String, Divergence>,
+    /// Effects kept in place by a declared `retain` strategy.
+    #[serde(default)]
+    pub retained: Vec<String>,
+    /// Effects escalated to a human by a declared `manual` strategy.
+    #[serde(default)]
+    pub manual: Vec<String>,
+    /// Effects whose compensation was verified by observing the original effect gone.
+    #[serde(default)]
+    pub restored: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -121,6 +142,16 @@ pub struct TransactionRun {
     pub failure: Option<FailureCause>,
     pub facts: BTreeMap<String, Value>,
     pub authority: Option<AuthorityRecord>,
+    /// Immutable pins recorded at SEALED (flow, policy, authority, action and recovery graphs).
+    #[serde(default)]
+    pub pins: Option<SealPins>,
+    /// When the transaction entered EXECUTING (for `maxExecutionDuration`).
+    #[serde(default)]
+    pub execution_started_at_ms: Option<u64>,
+    /// What a paused run is waiting for: `transaction` (WAITING_APPROVAL) or APPROVAL node ids.
+    /// Empty when the run is not paused.
+    #[serde(default)]
+    pub awaiting: Vec<String>,
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
     pub evidence: EvidenceChain,
@@ -148,6 +179,8 @@ impl TransactionRun {
                         observed: Value::Null,
                         discovered: None,
                         comparison: None,
+                        subrun: None,
+                        constraints: vec![],
                         outcome: None,
                         verification: None,
                         reason: None,
@@ -167,6 +200,7 @@ impl TransactionRun {
                     InvariantRun {
                         state: InvariantState::INITIAL,
                         scope: i.scope.clone(),
+                        severity: i.severity,
                         expr: i.expr.clone(),
                         last: None,
                     },
@@ -196,10 +230,17 @@ impl TransactionRun {
                 plan: vec![],
                 uncovered: vec![],
                 residual: vec![],
+                divergence: BTreeMap::new(),
+                retained: vec![],
+                manual: vec![],
+                restored: vec![],
             },
             failure: None,
             facts: BTreeMap::new(),
             authority: None,
+            pins: None,
+            execution_started_at_ms: None,
+            awaiting: vec![],
             started_at_ms: now,
             finished_at_ms: None,
             evidence: EvidenceChain::new(id, version, &plan.plan_hash),

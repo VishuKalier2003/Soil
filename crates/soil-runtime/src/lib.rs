@@ -8,14 +8,16 @@
 
 pub mod clock;
 pub mod engine;
+pub mod journal;
 pub mod providers;
 pub mod run;
 
 pub use clock::{Clock, LogicalClock, SystemClock};
 pub use engine::{Engine, EngineError, EngineOptions, RunResult};
+pub use journal::{FileJournal, JournalError};
 pub use providers::{
     ApprovalDecision, ApprovalProvider, ApprovalRequest, AuthorityDecision, AuthorityProvider,
-    AuthorityRequest, EventSink, NullSink, StaticApprovals, StaticAuthority,
+    AuthorityRequest, EventSink, Fanout, NullSink, StaticApprovals, StaticAuthority,
 };
 pub use run::{
     FailureCause, NodeRun, Resolution, ResolutionOutcome, SkipReason, TransactionRun,

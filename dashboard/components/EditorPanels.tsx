@@ -448,15 +448,25 @@ export function FlowSettings({ doc, update }: { doc: FlowDocument; update: Updat
         </Field>
       </Section>
       <Section title="Authority (AgentScript / Crane)">
-        <p className="muted small">Soil references the grant; the authority provider decides.</p>
+        <p className="muted small">
+          Soil does not authorize. It asks the provider about this exact contract and refuses a result for any other
+          contract hash.
+        </p>
         <div className="grid2">
           <Field label="Provider">
             <TextInput value={s.authority.provider} onChange={(v) => update((d) => (d.spec.authority.provider = v))} />
           </Field>
-          <Field label="Reference">
-            <TextInput mono value={s.authority.reference} onChange={(v) => update((d) => (d.spec.authority.reference = v))} />
+          <Field label="Contract id">
+            <TextInput mono value={s.authority.contractId} onChange={(v) => update((d) => (d.spec.authority.contractId = v))} />
           </Field>
         </div>
+        <Field label="Contract hash">
+          <TextInput mono value={s.authority.contractHash} onChange={(v) => update((d) => (d.spec.authority.contractHash = v))} />
+        </Field>
+      </Section>
+      <Section title="Aliases">
+        <p className="muted small">Names usable in expressions, e.g. deployment → facts.deploy.</p>
+        <JsonEditor value={s.aliases ?? {}} onChange={(v) => update((d) => (d.spec.aliases = v as Record<string, string>))} rows={4} />
       </Section>
       <Section title="Guarantees & policy">
         <Field label="Required guarantees" hint="planning fails if not derivable">
@@ -531,7 +541,7 @@ export function FlowSettings({ doc, update }: { doc: FlowDocument; update: Updat
 
 export function InvariantsPanel({ doc, update }: { doc: FlowDocument; update: Update }) {
   const invs = doc.spec.invariants ?? [];
-  const scopes = ["commit", ...doc.spec.nodes.filter((n) => n.kind === "CHECKPOINT").map((n) => `checkpoint:${n.id}`)];
+  const scopes = ["commit", "always", ...doc.spec.nodes.filter((n) => n.kind === "CHECKPOINT").map((n) => `checkpoint:${n.id}`)];
   const set = (i: number, fn: (x: (typeof invs)[number]) => void) =>
     update((d) => {
       const inv = d.spec.invariants?.[i];
@@ -555,7 +565,9 @@ export function InvariantsPanel({ doc, update }: { doc: FlowDocument; update: Up
         }
       >
         <p className="muted small">
-          Must be TRUE at their scope. UNKNOWN blocks commit unless the policy allows uncertainty and the invariant opts in.
+          Required invariants must be TRUE at their scope (`always` is also checked after every wave). UNKNOWN blocks
+          unless the policy allows uncertainty and the invariant opts in. Advisory invariants only degrade the guarantee.
+          Expressions support `in`, lists and durations like `500ms`.
         </p>
         {invs.map((inv, i) => (
           <div key={i} className="card">
@@ -576,6 +588,9 @@ export function InvariantsPanel({ doc, update }: { doc: FlowDocument; update: Up
               </Field>
               <Field label="On UNKNOWN">
                 <Select value={inv.onUnknown ?? "block"} options={["block", "allow"] as const} onChange={(v) => set(i, (x) => (x.onUnknown = v === "block" ? undefined : v))} />
+              </Field>
+              <Field label="Severity">
+                <Select value={inv.severity ?? "required"} options={["required", "advisory"] as const} onChange={(v) => set(i, (x) => (x.severity = v === "required" ? undefined : v))} />
               </Field>
             </div>
             <button className="danger small" onClick={() => update((d) => (d.spec.invariants = (d.spec.invariants ?? []).filter((_, j) => j !== i)))}>

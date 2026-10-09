@@ -44,6 +44,10 @@ pub struct FlowSpec {
     pub edges: Vec<EdgeSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invariants: Vec<InvariantSpec>,
+    /// Named paths usable as expression roots, e.g. `deployment: facts.deploy` so that an
+    /// invariant can read `deployment.replicas <= 50`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
     #[serde(default)]
     pub commit: CommitSpec,
     #[serde(default)]
@@ -72,13 +76,18 @@ pub struct InputSpec {
     pub default: Option<Value>,
 }
 
-/// Reference to the external authority (AgentScript/Crane) that governs this flow.
-/// Soil records it and asks the provider; it never interprets permissions itself.
+/// External authority reference: the AgentScript/Crane contract that authorizes this flow.
+/// Soil does not evaluate permissions. It passes this reference to the authority provider,
+/// consumes the authorization result, and refuses a result for any other contract hash.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthoritySpec {
+    /// Authority provider, e.g. `crane`.
     pub provider: String,
-    pub reference: String,
+    /// Contract identifier in the provider, e.g. `payments/remediation-prod`.
+    pub contract_id: String,
+    /// Content hash of the exact contract version this flow is bound to.
+    pub contract_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -198,6 +207,16 @@ pub struct NodeSpec {
     pub risk: Risk,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// How this action is recovered if the transaction fails (declared before execution).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ActionRecovery>,
+    /// COMPENSATE nodes only: run a published flow as the compensation, instead of an adapter
+    /// operation. The flow version is pinned at plan time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<SubflowRef>,
+    /// Declared (estimated) cost of the action, checked against `maxSpend`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<crate::constraints::Money>,
     /// Dashboard layout hint. Part of the canonical document so the editor round-trips it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<UiHints>,
@@ -231,8 +250,62 @@ impl NodeSpec {
             idempotency: None,
             risk: Risk::Low,
             timeout_ms: None,
+            recovery: None,
+            flow: None,
+            cost: None,
             ui: None,
         }
+    }
+}
+
+/// What recovery does with this action's effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryStrategy {
+    /// Undo it with the declared compensation (action or flow). Default when one is declared.
+    Compensate,
+    /// Leave it in place on purpose (e.g. keep an audit PR open). Recorded, not undone.
+    Retain,
+    /// Never undo it automatically; a human decides.
+    Manual,
+}
+
+/// Retry after an UNCERTAIN outcome, allowed only once observation has confirmed that the effect
+/// is absent, with the same idempotency key, for idempotent and reconcilable operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetrySpec {
+    /// Additional dispatches allowed (1–5).
+    pub max_attempts: u32,
+}
+
+/// Per-action recovery declaration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActionRecovery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<RecoveryStrategy>,
+    /// The COMPENSATE node that undoes this action (same as a `COMPENSATES` edge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compensation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetrySpec>,
+}
+
+/// A published flow run as a nested transaction (compensation flows).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubflowRef {
+    pub name: String,
+    pub version: u32,
+    /// Inputs for the flow; may use `${target.*}`, `${facts.*}` and `${inputs.*}`.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub inputs: Value,
+}
+
+impl std::fmt::Display for SubflowRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.name, self.version)
     }
 }
 
@@ -331,6 +404,16 @@ pub enum OnUnknown {
     Allow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// Must be SATISFIED for the transaction to commit (or for the checkpoint to pass).
+    #[default]
+    Required,
+    /// Evaluated and recorded; a violation degrades the guarantee but does not block.
+    Advisory,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InvariantSpec {
@@ -338,9 +421,11 @@ pub struct InvariantSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub expr: String,
-    /// `commit` or `checkpoint:<node id>`.
+    /// `commit`, `always` (also checked after every execution wave) or `checkpoint:<node id>`.
     #[serde(default = "default_scope")]
     pub scope: String,
+    #[serde(default)]
+    pub severity: Severity,
     #[serde(default)]
     pub on_unknown: OnUnknown,
 }
@@ -352,6 +437,8 @@ fn default_scope() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum InvariantScope {
     Commit,
+    /// Checked after every forward wave (a violation stops execution) and at commit.
+    Always,
     Checkpoint(String),
 }
 
@@ -359,6 +446,8 @@ impl InvariantSpec {
     pub fn parsed_scope(&self) -> Option<InvariantScope> {
         if self.scope == "commit" {
             Some(InvariantScope::Commit)
+        } else if self.scope == "always" {
+            Some(InvariantScope::Always)
         } else {
             self.scope
                 .strip_prefix("checkpoint:")
@@ -449,20 +538,61 @@ impl<'a> FlowGraph<'a> {
         deps
     }
 
+    /// The compensator of an action: a `COMPENSATES` edge, or the action's
+    /// `recovery.compensation`.
     pub fn compensator_of(&self, action: &str) -> Option<&'a str> {
-        self.spec
+        self.compensators_of(action).into_iter().next()
+    }
+
+    /// All declared compensators of an action (validation requires at most one).
+    pub fn compensators_of(&self, action: &str) -> Vec<&'a str> {
+        let mut out: Vec<&str> = self
+            .spec
             .edges
             .iter()
-            .find(|e| e.kind == EdgeKind::Compensates && e.to == action)
+            .filter(|e| e.kind == EdgeKind::Compensates && e.to == action)
             .map(|e| e.from.as_str())
+            .collect();
+        if let Some(c) = self
+            .node(action)
+            .and_then(|n| n.recovery.as_ref())
+            .and_then(|r| r.compensation.as_deref())
+        {
+            out.push(c);
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     pub fn compensation_target(&self, compensator: &str) -> Option<&'a str> {
-        self.spec
+        self.compensation_targets(compensator).into_iter().next()
+    }
+
+    /// Actions a COMPENSATE node is declared to undo (validation requires exactly one).
+    pub fn compensation_targets(&self, compensator: &str) -> Vec<&'a str> {
+        let mut out: Vec<&str> = self
+            .spec
             .edges
             .iter()
-            .find(|e| e.kind == EdgeKind::Compensates && e.from == compensator)
+            .filter(|e| e.kind == EdgeKind::Compensates && e.from == compensator)
             .map(|e| e.to.as_str())
+            .collect();
+        out.extend(
+            self.spec
+                .nodes
+                .iter()
+                .filter(|n| {
+                    n.recovery
+                        .as_ref()
+                        .and_then(|r| r.compensation.as_deref())
+                        == Some(compensator)
+                })
+                .map(|n| n.id.as_str()),
+        );
+        out.sort();
+        out.dedup();
+        out
     }
 
     pub fn verifiers_of(&self, action: &str) -> Vec<&'a str> {

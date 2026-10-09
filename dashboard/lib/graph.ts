@@ -248,7 +248,7 @@ export function newFlowDocument(name: string): FlowDocument {
     metadata: { name, description: "" },
     spec: {
       intent: { summary: `Describe what ${name} is meant to achieve`, actor: "agent:example", principal: "team:example" },
-      authority: { provider: "crane", reference: `crane://grants/${name}` },
+      authority: { provider: "crane", contractId: name, contractHash: "sha256:" },
       policies: [],
       guarantees: { require: [] },
       adapters: {},

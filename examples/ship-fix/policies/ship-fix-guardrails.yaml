@@ -1,0 +1,22 @@
+apiVersion: soil.dev/v1alpha1
+kind: Policy
+metadata:
+  name: ship-fix-guardrails
+  description: >
+    Transaction-level limits for shipping a fix. Authorization (who may ship) is the
+    Crane contract's job; this policy bounds what one shipping transaction may do.
+spec:
+  allowUncertainty: false          # UNKNOWN required invariants block commit
+  requireApprovalAtOrAbove: high
+  maxReconcileAttempts: 3
+  constraints:
+    maxReplicas: 50
+    maxSpend: {amount: 25, currency: USD}
+    allowedRegions: [eu-west-1]
+    requireVerification: true
+    requireCompensation: true
+    permittedAdapters: [github, kubernetes, ci, http]
+    maxActionCount: 8
+    maxExecutionDuration: 15m
+  parameters:
+    allowed_clusters: [prod]

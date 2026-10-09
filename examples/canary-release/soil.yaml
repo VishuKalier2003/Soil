@@ -1,0 +1,5 @@
+apiVersion: soil.dev/v1alpha1
+kind: Project
+metadata:
+  name: canary-release
+  description: Canary release with recovery against observed state

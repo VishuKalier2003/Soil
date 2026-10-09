@@ -21,6 +21,7 @@ export default function Home() {
   const [error, setError] = useState<string>();
   const [newName, setNewName] = useState("");
   const [start, setStart] = useState({ flow: "", scenario: "timeout-but-applied", latencyMs: 150, approvals: true, autoRecover: true });
+  const pauseAtApprovals = !start.approvals;
 
   const refresh = useCallback(async () => {
     try {
@@ -58,6 +59,7 @@ export default function Home() {
         scenario: start.scenario,
         latencyMs: start.latencyMs,
         approvals: start.approvals ? "all" : [],
+        deferApprovals: pauseAtApprovals,
         autoRecover: start.autoRecover,
       });
       router.push(`/runs/${id}`);
@@ -170,7 +172,7 @@ export default function Home() {
                       <td className="mono small">{r.flow.split("#")[0]}</td>
                       <td>{r.scenario}</td>
                       <td>
-                        <Badge state={r.state ?? (r.error ? "ERROR" : "STARTING")} />
+                        <Badge state={r.awaiting?.length ? "WAITING_APPROVAL" : r.state ?? (r.error ? "ERROR" : "STARTING")} />
                       </td>
                       <td>
                         <Badge state={r.recovery} />
@@ -201,7 +203,7 @@ export default function Home() {
               </Field>
               <label className="check">
                 <input type="checkbox" checked={start.approvals} onChange={() => setStart({ ...start, approvals: !start.approvals })} />
-                approve APPROVAL nodes (dev authority provider)
+                approve APPROVAL nodes now (otherwise the run pauses until approved)
               </label>
               <label className="check" style={{ margin: "6px 0 12px" }}>
                 <input type="checkbox" checked={start.autoRecover} onChange={() => setStart({ ...start, autoRecover: !start.autoRecover })} />

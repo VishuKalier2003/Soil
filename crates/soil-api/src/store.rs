@@ -3,7 +3,7 @@
 
 use crate::error::ApiError;
 use serde_json::{json, Value};
-use soil_adapters::sim::{Fault, SimScenario, WorldState};
+use soil_adapters::sim::{FaultRule, SimScenario, WorldState};
 use soil_core::canonical::hash_of;
 use soil_core::document::{from_value, resolve_adapter_refs, AdapterConfigDocument};
 use soil_core::evidence::EvidenceRecord;
@@ -103,10 +103,18 @@ impl ProjectRecord {
             .ok_or_else(|| ApiError::NotFound(format!("flow '{name}'")))
     }
 
+    /// Every published version of every flow (compensation flows are resolved from these).
+    pub fn flow_versions(&self) -> Vec<FlowVersion> {
+        self.flows.values().flat_map(|f| f.versions.iter().cloned()).collect()
+    }
+
     pub fn policy_versions(&self) -> Vec<PolicyVersion> {
         self.policies.values().flatten().cloned().collect()
     }
 }
+
+/// A simulated world and the faults it has left.
+pub type SimSnapshot = (WorldState, BTreeMap<String, Vec<FaultRule>>);
 
 pub struct RunRecord {
     pub id: String,
@@ -123,7 +131,8 @@ pub struct RunRecord {
     pub done: bool,
     pub error: Option<String>,
     pub world: Option<WorldState>,
-    pub faults: BTreeMap<String, Vec<Fault>>,
+    /// Faults still to trigger (limited faults count down across resumes).
+    pub faults: BTreeMap<String, Vec<FaultRule>>,
     pub events: broadcast::Sender<Live>,
 }
 
@@ -161,7 +170,7 @@ impl RunRecord {
             done: false,
             error: None,
             world: None,
-            faults: scenario.spec.faults.iter().map(|(k, f)| (k.clone(), f.list())).collect(),
+            faults: scenario.spec.faults.iter().map(|(k, f)| (k.clone(), f.rules())).collect(),
             events: broadcast::channel(8192).0,
         }
     }
@@ -180,6 +189,7 @@ impl RunRecord {
             "recovery": self.run.as_ref().map(|r| json!(r.recovery.state)),
             "guarantee": self.run.as_ref().map(|r| json!(r.guarantee.state)),
             "finishedAtMs": self.run.as_ref().and_then(|r| r.finished_at_ms),
+            "awaiting": self.run.as_ref().map(|r| json!(r.awaiting)),
         })
     }
 
@@ -258,12 +268,13 @@ impl AppState {
         &self,
         id: &str,
         outcome: Result<(Option<SealedTransaction>, TransactionRun), EngineError>,
-        world: WorldState,
+        (world, faults): SimSnapshot,
     ) {
         let mut store = self.lock();
         let Some(r) = store.runs.get_mut(id) else { return };
         r.done = true;
         r.world = Some(world);
+        r.faults = faults;
         match outcome {
             Ok((sealed, run)) => {
                 r.sealed = sealed;
@@ -275,11 +286,32 @@ impl AppState {
         let _ = r.events.send(Live::Done(summary));
     }
 
-    pub fn store_recovered(&self, id: &str, run: TransactionRun, world: WorldState) {
+    pub fn store_resumed(
+        &self,
+        id: &str,
+        sealed: Option<SealedTransaction>,
+        run: TransactionRun,
+        (world, faults): SimSnapshot,
+    ) {
+        let mut store = self.lock();
+        if let Some(r) = store.runs.get_mut(id) {
+            if sealed.is_some() {
+                r.sealed = sealed;
+            }
+            r.run = Some(run);
+            r.world = Some(world);
+        r.faults = faults;
+            let summary = r.summary();
+            let _ = r.events.send(Live::Done(summary));
+        }
+    }
+
+    pub fn store_recovered(&self, id: &str, run: TransactionRun, (world, faults): SimSnapshot) {
         let mut store = self.lock();
         if let Some(r) = store.runs.get_mut(id) {
             r.run = Some(run);
             r.world = Some(world);
+        r.faults = faults;
             let summary = r.summary();
             let _ = r.events.send(Live::Done(summary));
         }

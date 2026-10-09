@@ -9,6 +9,7 @@
 
 pub mod adapter;
 pub mod canonical;
+pub mod constraints;
 pub mod document;
 pub mod effect;
 pub mod evidence;

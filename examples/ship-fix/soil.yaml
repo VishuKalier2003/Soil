@@ -1,0 +1,5 @@
+apiVersion: soil.dev/v1alpha1
+kind: Project
+metadata:
+  name: ship-fix
+  description: inspect, modify, test, deploy, verify

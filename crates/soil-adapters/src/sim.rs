@@ -44,15 +44,32 @@ pub enum Fault {
 pub enum Faults {
     One(Fault),
     Many(Vec<Fault>),
+    /// A fault that triggers only the first `times` times, e.g. `{fault: timeout_before_apply, times: 1}`.
+    Limited { fault: Fault, times: u32 },
 }
 
 impl Faults {
     pub fn list(&self) -> Vec<Fault> {
+        self.rules().into_iter().map(|r| r.fault).collect()
+    }
+
+    pub fn rules(&self) -> Vec<FaultRule> {
         match self {
-            Faults::One(f) => vec![*f],
-            Faults::Many(v) => v.clone(),
+            Faults::One(f) => vec![FaultRule { fault: *f, remaining: None }],
+            Faults::Many(v) => v.iter().map(|f| FaultRule { fault: *f, remaining: None }).collect(),
+            Faults::Limited { fault, times } => vec![FaultRule {
+                fault: *fault,
+                remaining: Some(*times),
+            }],
         }
     }
+}
+
+/// A fault with an optional remaining trigger count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaultRule {
+    pub fault: Fault,
+    pub remaining: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -187,7 +204,7 @@ pub struct CallRecord {
 
 pub struct SimWorld {
     state: Mutex<WorldState>,
-    faults: BTreeMap<String, Vec<Fault>>,
+    faults: Mutex<BTreeMap<String, Vec<FaultRule>>>,
     latency_ms: u64,
     calls: Mutex<Vec<CallRecord>>,
 }
@@ -200,29 +217,65 @@ fn not_found() -> Handled {
 
 impl SimWorld {
     pub fn new(state: WorldState, faults: BTreeMap<String, Vec<Fault>>, latency_ms: u64) -> Self {
+        Self::with_rules(
+            state,
+            faults
+                .into_iter()
+                .map(|(k, v)| (k, v.into_iter().map(|fault| FaultRule { fault, remaining: None }).collect()))
+                .collect(),
+            latency_ms,
+        )
+    }
+
+    pub fn with_rules(state: WorldState, faults: BTreeMap<String, Vec<FaultRule>>, latency_ms: u64) -> Self {
         Self {
             state: Mutex::new(state),
-            faults,
+            faults: Mutex::new(faults),
             latency_ms,
             calls: Mutex::new(Vec::new()),
         }
     }
 
     pub fn from_scenario(scenario: &SimScenario) -> Self {
-        Self::new(
+        Self::with_rules(
             scenario.spec.world.clone(),
             scenario
                 .spec
                 .faults
                 .iter()
-                .map(|(k, f)| (k.clone(), f.list()))
+                .map(|(k, f)| (k.clone(), f.rules()))
                 .collect(),
             scenario.spec.latency_ms,
         )
     }
 
+    /// Takes the faults that apply to one request, consuming limited ones.
+    fn active_faults(&self, node_id: &str, read: bool) -> Vec<Fault> {
+        let mut all = self.faults.lock().expect("sim faults lock");
+        let Some(rules) = all.get_mut(node_id) else {
+            return vec![];
+        };
+        let mut out = Vec::new();
+        for rule in rules.iter_mut() {
+            let applies = (rule.fault == Fault::Unobservable) == read;
+            if !applies || rule.remaining == Some(0) {
+                continue;
+            }
+            if let Some(n) = rule.remaining.as_mut() {
+                *n -= 1;
+            }
+            out.push(rule.fault);
+        }
+        out
+    }
+
     pub fn snapshot(&self) -> WorldState {
         self.state.lock().expect("sim state lock").clone()
+    }
+
+    /// The world together with the faults still to trigger, to rebuild this simulator later.
+    pub fn snapshot_with_faults(&self) -> (WorldState, BTreeMap<String, Vec<FaultRule>>) {
+        (self.snapshot(), self.faults.lock().expect("sim faults lock").clone())
     }
 
     pub fn calls(&self) -> Vec<CallRecord> {
@@ -259,8 +312,15 @@ impl Transport for SimWorld {
         if self.latency_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.latency_ms));
         }
-        let faults = self.faults.get(&req.node_id).cloned().unwrap_or_default();
-        let fault = faults.iter().copied().find(|f| *f != Fault::Unobservable);
+        let faults = self.active_faults(&req.node_id, req.is_read());
+        // `partial` shapes what gets applied; another fault may shape the response on top of it
+        // (e.g. `[lost_after_apply, partial]`: applied halfway, then the connection drops).
+        let fault = faults
+            .iter()
+            .copied()
+            .find(|f| !matches!(f, Fault::Unobservable | Fault::Partial))
+            .or_else(|| faults.iter().copied().find(|f| *f == Fault::Partial));
+        let applied = if faults.contains(&Fault::Partial) { Some(Fault::Partial) } else { fault };
         let response = if req.is_read() {
             if faults.contains(&Fault::Unobservable) {
                 ProviderResponse::Timeout
@@ -278,7 +338,7 @@ impl Transport for SimWorld {
                     message: "service unavailable".into(),
                 },
                 Some(Fault::TimeoutBeforeApply) => ProviderResponse::Timeout,
-                _ => match (fault, self.handle(req, fault)) {
+                _ => match (fault, self.handle(req, applied)) {
                     (Some(Fault::TimeoutAfterApply), Ok(_)) => ProviderResponse::Timeout,
                     (Some(Fault::LostAfterApply), Ok(_)) => ProviderResponse::ConnectionLost,
                     (_, handled) => to_response(handled),
@@ -504,6 +564,9 @@ fn kubernetes(st: &mut WorldState, req: &ProviderRequest, path: &str, fault: Opt
                 }
                 d.ready_replicas = if fault == Some(Fault::Partial) { Some(1) } else { None };
             }
+            if let Some(n) = req.body["spec"]["replicas"].as_u64() {
+                d.replicas = n;
+            }
             if let Some(cfg) = req.body["metadata"]["annotations"][CONFIG_ANNOTATION].as_str() {
                 if cfg != d.config_version {
                     d.previous_config_version =
@@ -578,7 +641,15 @@ fn ci(
                 return Ok((200, run_json(existing)));
             }
             let run = CiRun {
-                id: format!("run-{}", st.runs.len() + 1),
+                // Derived from the request, not arrival order, so concurrent requests get the
+                // same ids in every run (the mocked world stays deterministic).
+                id: format!(
+                    "run-{}",
+                    &sha256_hex(
+                        format!("{pipeline}:{}:{}", req.body["job"], req.idempotency_key.as_deref().unwrap_or(""))
+                            .as_bytes()
+                    )[..10]
+                ),
                 pipeline: pipeline.to_string(),
                 job: req.body["job"].as_str().unwrap_or("pipeline").to_string(),
                 git_ref: req.body["ref"].clone(),
@@ -613,12 +684,27 @@ fn ci(
 // ---------------------------------------------------------------------------------------------
 // HTTP
 
+/// A fixture whose body depends on which image a deployment runs, e.g. an SLO endpoint that is
+/// healthy for one image and not for another:
+/// `{"$byDeploymentImage": {"deployment": "prod/shop/api", "cases": {"<image>": {...}}, "default": {...}}}`.
+fn resolve_fixture(st: &WorldState, body: &Value) -> Option<Value> {
+    let Some(rule) = body.get("$byDeploymentImage") else {
+        return Some(body.clone());
+    };
+    let key = rule["deployment"].as_str()?;
+    let image = st.deployments.get(key).map(|d| d.image.clone()).unwrap_or_default();
+    rule["cases"]
+        .get(&image)
+        .or_else(|| rule.get("default"))
+        .cloned()
+}
+
 fn http(st: &mut WorldState, req: &ProviderRequest) -> Handled {
     match req.method.as_str() {
         "GET" => st
             .http
             .get(&req.path)
-            .cloned()
+            .and_then(|b| resolve_fixture(st, b))
             .map(|v| (200, v))
             .ok_or((404, "Not Found".into())),
         "POST" => {

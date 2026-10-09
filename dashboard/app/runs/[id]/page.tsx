@@ -115,6 +115,16 @@ function Inspector() {
   const record = selectedRecord !== undefined ? records.find((r) => r.seq === selectedRecord) : undefined;
   const canRecover = run && (run.state === "FAILED" || run.state === "UNCERTAIN") && run.recovery.state === "NOT_REQUIRED";
   const canResolve = run?.state === "MANUAL_INTERVENTION";
+  const awaiting = run?.awaiting ?? [];
+
+  const approveAndResume = async () => {
+    try {
+      await api.resume(id, { approvals: awaiting });
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
 
   const recover = async (resolve?: string) => {
     try {
@@ -158,6 +168,17 @@ function Inspector() {
         </span>
       </div>
       <ErrorBanner error={error ?? detail.error ?? undefined} onClose={() => setError(undefined)} />
+      {awaiting.length ? (
+        <div className="banner info" style={{ margin: "8px 16px" }}>
+          <span>
+            Paused: waiting for approval of <strong className="mono">{awaiting.join(", ")}</strong>. The run is persisted
+            and resumes exactly where it stopped.
+          </span>
+          <button className="primary" onClick={approveAndResume}>
+            Approve &amp; resume
+          </button>
+        </div>
+      ) : null}
       <div className="workspace run" style={{ height: "calc(100vh - 48px - 74px)" }}>
         <div className="canvas">
           <ReactFlow
@@ -219,9 +240,23 @@ function Inspector() {
                         ["outcome", nodeRun?.outcome ?? "—"],
                         ["verification", nodeLive?.verification ?? nodeRun?.verification ?? "—"],
                         ["reason", nodeLive?.reason ?? nodeRun?.reason ?? "—"],
+                        ["divergence", nodeRun?.comparison?.divergence ?? "—"],
+                        ["recovery", nodeSpec.recovery ? [nodeSpec.recovery.strategy, nodeSpec.recovery.compensation && `compensation ${nodeSpec.recovery.compensation}`, nodeSpec.recovery.retry && `retry ×${nodeSpec.recovery.retry.maxAttempts}`].filter(Boolean).join(" · ") : "—"],
+                        ["compensation flow", nodeSpec.flow ? `${nodeSpec.flow.name}@${nodeSpec.flow.version}` + (nodeRun?.subrun ? ` → ${nodeRun.subrun.id} ${nodeRun.subrun.state}` : "") : "—"],
                       ]}
                     />
                   </Section>
+                  {nodeRun?.constraints?.length ? (
+                    <Section title="Transaction constraints">
+                      <ul className="plain mono small">
+                        {nodeRun.constraints.map((c, i) => (
+                          <li key={i} style={{ color: c.result === "true" ? "var(--ok)" : c.result === "false" ? "var(--bad)" : "var(--warn)" }}>
+                            {c.result.toUpperCase()} · {c.constraint}: {c.detail}
+                          </li>
+                        ))}
+                      </ul>
+                    </Section>
+                  ) : null}
                   {nodeRun?.comparison ? (
                     <Section title="Expected vs observed">
                       <KeyValue
@@ -317,6 +352,9 @@ function Inspector() {
                         ["plan", run.recovery.plan.join(", ") || "—"],
                         ["uncovered", run.recovery.uncovered.join(", ") || "—"],
                         ["residual", run.recovery.residual.join(", ") || "—"],
+                        ["restored (verified)", run.recovery.restored?.join(", ") || "—"],
+                        ["retained", run.recovery.retained?.join(", ") || "—"],
+                        ["manual", run.recovery.manual?.join(", ") || "—"],
                       ]}
                     />
                   </Section>
@@ -327,6 +365,7 @@ function Inspector() {
                           <tr>
                             <th>Action</th>
                             <th>Presence</th>
+                            <th>Divergence</th>
                             <th>Final state</th>
                           </tr>
                         </thead>
@@ -335,6 +374,7 @@ function Inspector() {
                             <tr key={n} className="clickable" onClick={() => { setSelected(n); setTab("node"); }}>
                               <td className="mono">{n}</td>
                               <td>{p}</td>
+                              <td>{run.recovery.divergence?.[n] ?? "—"}</td>
                               <td>
                                 <Badge state={run.nodes[n]?.action} />
                               </td>
@@ -406,7 +446,16 @@ function Inspector() {
                     ["plan hash", <span key="p" className="mono">{short(detail.plan.planHash, 24)}</span>],
                     ["seal hash", <span key="s" className="mono">{short(detail.sealed?.sealHash, 24)}</span>],
                     ["policies", detail.plan.policy.refs.join(", ") || "—"],
-                    ["authority", detail.sealed ? `${detail.sealed.authority.provider} · ${detail.sealed.authority.decisionRef}` : "—"],
+                    ["pinned policy", <span key="pp" className="mono">{short(run?.pins?.policyHash, 24)}</span>],
+                    ["pinned authority", <span key="pa" className="mono">{short(run?.pins?.authorityHash, 24)}</span>],
+                    ["pinned action graph", <span key="pg" className="mono">{short(run?.pins?.actionGraphHash, 24)}</span>],
+                    ["pinned recovery graph", <span key="pr" className="mono">{short(run?.pins?.recoveryGraphHash, 24)}</span>],
+                    [
+                      "authority",
+                      detail.sealed
+                        ? `${detail.sealed.authority.provider} contract ${detail.sealed.authority.contractId} · ${detail.sealed.authority.decisionRef}`
+                        : "—",
+                    ],
                   ]}
                 />
               </Section>

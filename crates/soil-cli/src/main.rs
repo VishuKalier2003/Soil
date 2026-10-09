@@ -1,8 +1,9 @@
 //! `soil` — validate, publish, plan, run, inspect and recover Soil transactions.
 //!
-//! Exit codes for `transaction run` / `recover`:
+//! Exit codes for `transaction run` / `resume` / `recover`:
 //! 0 committed · 10 recovered or aborted (no lasting effect) · 20 needs attention
-//! (partially recovered, manual intervention, halted) · 1 usage/validation errors.
+//! (partially recovered, manual intervention, halted) · 30 paused waiting for an approval
+//! · 75 executor killed on purpose (`--crash-after`) · 1 usage/validation errors.
 
 mod output;
 mod project;
@@ -12,14 +13,14 @@ use project::{read_document, Project};
 use serde_json::{json, Value};
 use soil_adapters::sim::{SimWorld, WorldState};
 use soil_core::document::{parse_value, validate_adapter_config, validate_policy, Document};
-use soil_core::plan::{plan, TransactionPlan};
+use soil_core::plan::{plan_with, TransactionPlan};
 use soil_core::policy::EffectivePolicy;
 use soil_core::state::TransactionState;
 use soil_core::transaction::{FlowVersion, PublishOutcome, TransactionId};
 use soil_core::validate::validate_flow;
 use soil_runtime::{
-    Clock, Engine, EngineOptions, LogicalClock, Resolution, ResolutionOutcome, StaticApprovals,
-    StaticAuthority, SystemClock, TransactionRun,
+    Clock, Engine, EngineOptions, Fanout, FileJournal, LogicalClock, Resolution, ResolutionOutcome,
+    StaticApprovals, StaticAuthority, SystemClock, TransactionRun,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -74,6 +75,9 @@ enum Command {
         dir: PathBuf,
         #[arg(long)]
         force: bool,
+        /// Which example to scaffold: `remediation` (default), `ship-fix` or `canary-release`.
+        #[arg(long, default_value = "remediation")]
+        example: String,
     },
     /// Validate every document in the project.
     Validate,
@@ -118,9 +122,13 @@ enum TxCmd {
     Run {
         #[command(flatten)]
         plan: PlanArgs,
-        /// Approve APPROVAL nodes: node id or `all`. Repeatable. Default: none approved.
+        /// Approve APPROVAL nodes: node id, `transaction`, or `all`. Repeatable.
         #[arg(long)]
         approve: Vec<String>,
+        /// Leave approvals that were not given pending: the run pauses and
+        /// `soil transaction resume` continues it. Default: unapproved means denied.
+        #[arg(long)]
+        defer_approvals: bool,
         /// Halt in FAILED/UNCERTAIN instead of running recovery immediately.
         #[arg(long)]
         no_recover: bool,
@@ -136,6 +144,23 @@ enum TxCmd {
         /// Nonce for the transaction id (default: current time).
         #[arg(long)]
         nonce: Option<String>,
+        /// Demonstration: kill the executor right after journal record N is written.
+        #[arg(long, hide = true)]
+        crash_after: Option<u64>,
+    },
+    /// Continue a paused, halted or interrupted transaction from its journal.
+    Resume {
+        id: String,
+        /// Approve APPROVAL nodes: node id, `transaction`, or `all`. Repeatable.
+        #[arg(long)]
+        approve: Vec<String>,
+        /// Leave approvals that were not given pending (pause again).
+        #[arg(long)]
+        defer_approvals: bool,
+        #[arg(long, short)]
+        quiet: bool,
+        #[arg(long, hide = true)]
+        crash_after: Option<u64>,
     },
     /// Show a transaction's state.
     Status { id: Option<String> },
@@ -213,7 +238,7 @@ fn project(cli_project: &Option<PathBuf>) -> Result<Project, CliError> {
 
 fn dispatch(cli: Cli) -> Result<u8, CliError> {
     match cli.command {
-        Command::Init { dir, force } => init(&dir, force),
+        Command::Init { dir, force, example } => init(&dir, force, &example),
         Command::Validate => validate_project(&project(&cli.project)?),
         Command::Flow(FlowCmd::Validate { file }) => flow_validate(&project(&cli.project)?, &file),
         Command::Flow(FlowCmd::Publish { file }) => flow_publish(&project(&cli.project)?, &file),
@@ -230,18 +255,27 @@ fn dispatch(cli: Cli) -> Result<u8, CliError> {
         Command::Transaction(TxCmd::Run {
             plan: args,
             approve,
+            defer_approvals,
             no_recover,
             deterministic,
             quiet,
             verbose,
             nonce,
+            crash_after,
         }) => tx_run(
             &project(&cli.project)?,
             &args,
-            &approve,
-            RunFlags { no_recover, deterministic, quiet, verbose },
+            &approvals(&approve, defer_approvals),
+            RunFlags { no_recover, deterministic, quiet, verbose, crash_after },
             nonce,
         ),
+        Command::Transaction(TxCmd::Resume {
+            id,
+            approve,
+            defer_approvals,
+            quiet,
+            crash_after,
+        }) => tx_resume(&project(&cli.project)?, &id, &approvals(&approve, defer_approvals), quiet, crash_after),
         Command::Transaction(TxCmd::Status { id }) => {
             let p = project(&cli.project)?;
             let id = match id {
@@ -303,14 +337,57 @@ fn report(path: &Path, r: &soil_core::validate::ValidationReport) -> Result<u8, 
     }
 }
 
-fn init(dir: &Path, force: bool) -> Result<u8, CliError> {
+const SHIP_FIX: &[(&str, &str)] = &[
+    ("soil.yaml", include_str!("../../../examples/ship-fix/soil.yaml")),
+    ("flows/ship-fix.yaml", include_str!("../../../examples/ship-fix/flows/ship-fix.yaml")),
+    ("policies/ship-fix-guardrails.yaml", include_str!("../../../examples/ship-fix/policies/ship-fix-guardrails.yaml")),
+    ("scenarios/happy-path.yaml", include_str!("../../../examples/ship-fix/scenarios/happy-path.yaml")),
+    ("scenarios/slo-regression.yaml", include_str!("../../../examples/ship-fix/scenarios/slo-regression.yaml")),
+];
+
+const CANARY_RELEASE: &[(&str, &str)] = &[
+    ("soil.yaml", include_str!("../../../examples/canary-release/soil.yaml")),
+    ("flows/canary-release.yaml", include_str!("../../../examples/canary-release/flows/canary-release.yaml")),
+    ("flows/traffic-failback.yaml", include_str!("../../../examples/canary-release/flows/traffic-failback.yaml")),
+    ("policies/canary-guardrails.yaml", include_str!("../../../examples/canary-release/policies/canary-guardrails.yaml")),
+    ("scenarios/happy-path.yaml", include_str!("../../../examples/canary-release/scenarios/happy-path.yaml")),
+    ("scenarios/slo-violation.yaml", include_str!("../../../examples/canary-release/scenarios/slo-violation.yaml")),
+    ("scenarios/retry-after-timeout.yaml", include_str!("../../../examples/canary-release/scenarios/retry-after-timeout.yaml")),
+    ("scenarios/uncertain-partial-shift.yaml", include_str!("../../../examples/canary-release/scenarios/uncertain-partial-shift.yaml")),
+    ("scenarios/rollback-rejected.yaml", include_str!("../../../examples/canary-release/scenarios/rollback-rejected.yaml")),
+];
+
+fn init(dir: &Path, force: bool, example: &str) -> Result<u8, CliError> {
+    let (files, flow, next) = match example {
+        "remediation" => (
+            EXAMPLE,
+            "flows/prod-remediation.yaml",
+            "soil transaction run --flow prod-remediation --scenario timeout-but-applied --approve all",
+        ),
+        "ship-fix" => (
+            SHIP_FIX,
+            "flows/ship-fix.yaml",
+            "soil transaction run --flow ship-fix --scenario happy-path --approve all",
+        ),
+        "canary-release" => (
+            CANARY_RELEASE,
+            "flows/traffic-failback.yaml
+  soil flow publish flows/canary-release.yaml",
+            "soil transaction run --flow canary-release --scenario slo-violation",
+        ),
+        other => {
+            return Err(CliError::Usage(format!(
+                "unknown example '{other}' (remediation | ship-fix | canary-release)"
+            )))
+        }
+    };
     if dir.join("soil.yaml").exists() && !force {
         return Err(CliError::Usage(format!(
             "{} already contains soil.yaml (use --force to overwrite)",
             dir.display()
         )));
     }
-    for (rel, content) in EXAMPLE {
+    for (rel, content) in files {
         let path = dir.join(rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| CliError::io(parent, e))?;
@@ -318,9 +395,10 @@ fn init(dir: &Path, force: bool) -> Result<u8, CliError> {
         std::fs::write(&path, content).map_err(|e| CliError::io(&path, e))?;
         println!("created {}", path.display());
     }
-    println!(
-        "\nNext:\n  soil validate\n  soil flow publish flows/prod-remediation.yaml\n  soil transaction run --flow prod-remediation --scenario timeout-but-applied --approve all"
-    );
+    for sub in ["policies", "adapters"] {
+        std::fs::create_dir_all(dir.join(sub)).map_err(|e| CliError::io(dir, e))?;
+    }
+    println!("\nNext:\n  soil validate\n  soil flow publish {flow}\n  {next}");
     Ok(0)
 }
 
@@ -431,7 +509,13 @@ fn make_plan(p: &Project, args: &PlanArgs) -> Result<(TransactionPlan, Option<so
     let scenario = args.scenario.as_deref().map(|s| p.scenario(s)).transpose()?;
     let defaults = scenario.as_ref().map(|s| s.spec.inputs.clone()).unwrap_or_default();
     let inputs = parse_inputs(args, defaults)?;
-    let plan = plan(&version, inputs, &soil_adapters::catalog(), &p.policy_versions()?)?;
+    let plan = plan_with(
+        &version,
+        inputs,
+        &soil_adapters::catalog(),
+        &p.policy_versions()?,
+        &p.all_flow_versions()?,
+    )?;
     Ok((plan, scenario))
 }
 
@@ -465,32 +549,77 @@ struct RunFlags {
     deterministic: bool,
     quiet: bool,
     verbose: bool,
+    crash_after: Option<u64>,
 }
 
-fn exit_code(state: TransactionState) -> u8 {
-    match state {
+/// Keeps the simulated world's state next to the journal so a resumed run sees the same world.
+struct WorldSnapshot {
+    sim: Arc<SimWorld>,
+    path: PathBuf,
+}
+
+impl soil_runtime::EventSink for WorldSnapshot {
+    fn on_event(&self, _: &soil_core::evidence::EvidenceRecord, _: &TransactionRun) {
+        project::write_json(&self.path, &self.sim.snapshot()).expect("world snapshot is writable");
+    }
+}
+
+/// Demonstrates restartability: terminates the process right after record `at` is journaled.
+struct CrashAfter(Option<u64>);
+
+impl soil_runtime::EventSink for CrashAfter {
+    fn on_event(&self, record: &soil_core::evidence::EvidenceRecord, _: &TransactionRun) {
+        if self.0 == Some(record.seq) {
+            eprintln!(
+                "\n  !! executor killed after journal record #{} ({:?} {} → {}); resume with `soil transaction resume {}`",
+                record.seq,
+                record.machine,
+                record.node_id.as_deref().unwrap_or(""),
+                record.state_after,
+                record.transaction_id
+            );
+            std::process::exit(75);
+        }
+    }
+}
+
+fn exit_code(run: &TransactionRun) -> u8 {
+    if !run.awaiting.is_empty() {
+        return 30;
+    }
+    match run.state {
         TransactionState::Committed => 0,
         TransactionState::Recovered | TransactionState::Aborted | TransactionState::Cancelled => 10,
         _ => 20,
     }
 }
 
-fn approvals(approve: &[String]) -> StaticApprovals {
+fn approvals(approve: &[String], defer: bool) -> StaticApprovals {
     if approve.iter().any(|a| a == "all") {
         StaticApprovals::approve_all("cli")
+    } else if defer {
+        StaticApprovals::deferred(approve.iter().cloned(), "cli")
     } else {
         StaticApprovals::only(approve.iter().cloned(), "cli")
     }
 }
 
+fn scenario_faults(scenario: &Value) -> BTreeMap<String, Vec<soil_adapters::sim::Fault>> {
+    serde_json::from_value::<BTreeMap<String, soil_adapters::sim::Faults>>(scenario["faults"].clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, f)| (k, f.list()))
+        .collect()
+}
+
 fn tx_run(
     p: &Project,
     args: &PlanArgs,
-    approve: &[String],
+    approvals: &StaticApprovals,
     flags: RunFlags,
     nonce: Option<String>,
 ) -> Result<u8, CliError> {
-    let RunFlags { no_recover, deterministic, quiet, verbose } = flags;
+    let RunFlags { no_recover, deterministic, quiet, verbose, crash_after } = flags;
     let (plan, scenario) = make_plan(p, args)?;
     let scenario = scenario.ok_or_else(|| {
         CliError::Usage(
@@ -506,29 +635,78 @@ fn tx_run(
     };
     let nonce = nonce.unwrap_or_else(|| SystemClock.now_ms().to_string());
     let id = TransactionId::derive(&plan.plan_hash, &nonce);
-    let approvals = approvals(approve);
-    let authority = StaticAuthority::grant_all();
-    let printer = Printer { quiet, verbose };
-    let engine = Engine {
-        adapters: &registry,
-        clock: clock.as_ref(),
-        authority: &authority,
-        approvals: &approvals,
-        sink: &printer,
-        options: EngineOptions { auto_recover: !no_recover },
-    };
-    output::print_header(&plan, id.as_str(), &scenario);
-    let result = engine.run(plan, id)?;
     let scenario_json = json!({
         "name": scenario.name,
         "faults": scenario.spec.faults,
         "latencyMs": scenario.spec.latency_ms,
         "expect": scenario.spec.expect,
     });
-    let dir = p.save_run(result.sealed.as_ref(), &result.run, &sim.snapshot(), &scenario_json)?;
+    // Everything needed to restart is on disk before the first transition.
+    let dir = p.run_dir(id.as_str());
+    project::write_json(&dir.join("plan.json"), &plan)?;
+    project::write_json(&dir.join("scenario.json"), &scenario_json)?;
+    let journal = FileJournal::new(&dir).map_err(|e| CliError::Io(dir.display().to_string(), e.to_string()))?;
+    let world = WorldSnapshot { sim: sim.clone(), path: dir.join("world.json") };
+    let printer = Printer { quiet, verbose };
+    let crash = CrashAfter(crash_after);
+    let sink = Fanout(vec![&journal, &world, &printer, &crash]);
+    let authority = StaticAuthority::grant_all();
+    let engine = Engine {
+        adapters: &registry,
+        clock: clock.as_ref(),
+        authority: &authority,
+        approvals,
+        sink: &sink,
+        options: EngineOptions { auto_recover: !no_recover },
+    };
+    output::print_header(&plan, id.as_str(), &scenario);
+    let result = engine.run(plan, id)?;
+    p.save_run(result.sealed.as_ref(), &result.run, &sim.snapshot(), &scenario_json)?;
     output::print_summary(&result.run, scenario.spec.expect.as_deref());
     println!("  stored    {}", dir.display());
-    Ok(exit_code(result.run.state))
+    Ok(exit_code(&result.run))
+}
+
+fn tx_resume(
+    p: &Project,
+    id: &str,
+    approvals: &StaticApprovals,
+    quiet: bool,
+    crash_after: Option<u64>,
+) -> Result<u8, CliError> {
+    let dir = p.find_run_dir(id)?;
+    let plan: soil_core::plan::TransactionPlan = project::read_json(&dir.join("plan.json"))?;
+    let journal = FileJournal::new(&dir).map_err(|e| CliError::Io(dir.display().to_string(), e.to_string()))?;
+    let run = journal
+        .load()
+        .map_err(|e| CliError::Corrupt(dir.display().to_string(), e.to_string()))?;
+    let scenario: Value = project::read_json(&dir.join("scenario.json"))?;
+    let world: WorldState = project::read_json(&dir.join("world.json"))?;
+    let sim = Arc::new(SimWorld::new(world, scenario_faults(&scenario), 0));
+    let registry = soil_adapters::registry(sim.clone());
+    let world_sink = WorldSnapshot { sim: sim.clone(), path: dir.join("world.json") };
+    let printer = Printer { quiet, verbose: false };
+    let crash = CrashAfter(crash_after);
+    let sink = Fanout(vec![&journal, &world_sink, &printer, &crash]);
+    let authority = StaticAuthority::grant_all();
+    let engine = Engine {
+        adapters: &registry,
+        clock: &SystemClock,
+        authority: &authority,
+        approvals,
+        sink: &sink,
+        options: EngineOptions::default(),
+    };
+    println!(
+        "resuming {} from journal record #{} ({})\n",
+        run.id,
+        run.evidence.len().saturating_sub(1),
+        run.state
+    );
+    let result = engine.resume(&plan, run)?;
+    p.save_run(result.sealed.as_ref(), &result.run, &sim.snapshot(), &scenario)?;
+    output::print_summary(&result.run, scenario["expect"].as_str());
+    Ok(exit_code(&result.run))
 }
 
 fn tx_recover(
@@ -545,26 +723,20 @@ fn tx_recover(
     let dir = p.run_dir(&run.id);
     let world: WorldState = project::read_json(&dir.join("world.json"))?;
     let scenario: Value = project::read_json(&dir.join("scenario.json"))?;
-    let faults: BTreeMap<String, Vec<soil_adapters::sim::Fault>> = if clear_faults {
-        BTreeMap::new()
-    } else {
-        serde_json::from_value::<BTreeMap<String, soil_adapters::sim::Faults>>(scenario["faults"].clone())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, f)| (k, f.list()))
-            .collect()
-    };
+    let faults = if clear_faults { BTreeMap::new() } else { scenario_faults(&scenario) };
     let sim = Arc::new(SimWorld::new(world, faults, 0));
     let registry = soil_adapters::registry(sim.clone());
     let approvals = StaticApprovals::approve_all("cli");
     let authority = StaticAuthority::grant_all();
     let printer = Printer { quiet, verbose: false };
+    let journal = FileJournal::new(&dir).map_err(|e| CliError::Io(dir.display().to_string(), e.to_string()))?;
+    let sink = Fanout(vec![&journal, &printer]);
     let engine = Engine {
         adapters: &registry,
         clock: &SystemClock,
         authority: &authority,
         approvals: &approvals,
-        sink: &printer,
+        sink: &sink,
         options: EngineOptions::default(),
     };
     let updated = match resolve {
@@ -581,5 +753,5 @@ fn tx_recover(
     };
     p.save_run(Some(&sealed), &updated, &sim.snapshot(), &scenario)?;
     output::print_summary(&updated, None);
-    Ok(exit_code(updated.state))
+    Ok(exit_code(&updated))
 }

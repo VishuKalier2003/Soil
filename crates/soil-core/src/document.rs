@@ -254,6 +254,18 @@ pub fn validate_policy(doc: &PolicyDocument) -> ValidationReport {
             "must be between 1 and 10",
         );
     }
+    for problem in doc.spec.constraints.problems() {
+        r.error("constraint", "spec.constraints", problem);
+    }
+    for name in doc.spec.parameters.keys() {
+        if !crate::validate::valid_id(name) || crate::validate::RESERVED_ROOTS.contains(&name.as_str()) {
+            r.error(
+                "parameter",
+                format!("spec.parameters.{name}"),
+                "parameter names must match [a-z_][a-z0-9_]* and not shadow a reserved name",
+            );
+        }
+    }
     if doc.spec.allow_uncertainty {
         r.warn(
             "uncertainty",

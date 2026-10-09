@@ -7,4 +7,5 @@ spec:
   version: 1
   config:
     cluster: prod-eu
+    region: eu-west-1
     kubeconfig: {secretRef: file:/var/run/soil/kubeconfig-prod-eu}

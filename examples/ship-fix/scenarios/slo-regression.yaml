@@ -1,0 +1,17 @@
+apiVersion: soil.dev/v1alpha1
+kind: SimScenario
+metadata:
+  name: slo-regression
+spec:
+  description: "The deploy works but the SLO check fails. Nothing commits; the rollout, traffic shift and branch are undone."
+  expect: RECOVERED
+  inputs: {image: "ghcr.io/acme/shop:2.4.1"}
+  world:
+    repos:
+      acme/shop: {defaultBranch: main, headSha: 5be17d0}
+    deployments:
+      prod/shop/api: {image: "ghcr.io/acme/shop:2.4.0", configVersion: cfg-9, replicas: 3}
+    traffic:
+      prod/shop/api: {canary: 0}
+    http:
+      "https://slo.test/shop": {p95_latency: "950ms", error_rate: 0.051, p99_ms: 900}

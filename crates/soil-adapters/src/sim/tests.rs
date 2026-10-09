@@ -144,6 +144,61 @@ fn partial_effects_are_observed_as_partial() {
 }
 
 #[test]
+fn limited_faults_trigger_only_n_times() {
+    let mut scenario = SimScenario::parse(
+        "apiVersion: soil.dev/v1alpha1\nkind: SimScenario\nmetadata: {name: s}\nspec:\n  faults: {deploy: {fault: timeout_before_apply, times: 1}}\n",
+    )
+    .unwrap();
+    scenario.spec.world = world();
+    let r = registry(Arc::new(SimWorld::from_scenario(&scenario)));
+    let k8s = r.get("kubernetes").unwrap();
+    assert_eq!(k8s.execute(&rollout("deploy")).kind(), ResultKind::Uncertain);
+    assert_eq!(presence(&k8s.observe(&rollout("deploy"))), Some(Presence::Absent));
+    assert_eq!(k8s.execute(&rollout("deploy")).kind(), ResultKind::Success, "the fault is used up");
+}
+
+#[test]
+fn fixtures_can_depend_on_the_deployed_image() {
+    let mut w = world();
+    w.http.insert(
+        "https://slo/by-image".into(),
+        json!({"$byDeploymentImage": {
+            "deployment": "prod/checkout/api",
+            "cases": {"app:2": {"error_rate": 0.2}},
+            "default": {"error_rate": 0.001}
+        }}),
+    );
+    let sim = Arc::new(SimWorld::new(w, Default::default(), 0));
+    let r = registry(sim);
+    let get = inv("slo", "get", "https://slo/by-image", Value::Null);
+    let http = r.get("http").unwrap();
+    assert_eq!(state(http.execute(&get))["error_rate"], 0.001);
+    r.get("kubernetes").unwrap().execute(&rollout("deploy"));
+    assert_eq!(state(http.execute(&get))["error_rate"], 0.2);
+}
+
+#[test]
+fn restored_traffic_reports_the_shift_absent() {
+    let (_, r) = setup(&[]);
+    let k8s = r.get("kubernetes").unwrap();
+    let shift = inv("shift", "traffic.shift", TRAFFIC, json!({"canary_weight": 100}));
+    k8s.execute(&shift);
+    assert_eq!(presence(&k8s.observe(&shift)), Some(Presence::Present));
+    k8s.execute(&inv("restore", "traffic.restore", TRAFFIC, json!({"canary_weight": 0})));
+    assert_eq!(presence(&k8s.observe(&shift)), Some(Presence::Absent));
+}
+
+#[test]
+fn partial_application_combines_with_a_lost_response() {
+    let faults = [("shift".to_string(), vec![Fault::LostAfterApply, Fault::Partial])];
+    let r = registry(Arc::new(SimWorld::new(world(), faults.into_iter().collect(), 0)));
+    let k8s = r.get("kubernetes").unwrap();
+    let shift = inv("shift", "traffic.shift", TRAFFIC, json!({"canary_weight": 100}));
+    assert_eq!(k8s.execute(&shift).kind(), ResultKind::Uncertain);
+    assert_eq!(presence(&k8s.observe(&shift)), Some(Presence::Partial));
+}
+
+#[test]
 fn faults_combine() {
     let sim = Arc::new(SimWorld::new(
         world(),

@@ -134,7 +134,8 @@ impl fmt::Display for TransactionId {
 #[serde(rename_all = "camelCase")]
 pub struct AuthorityRecord {
     pub provider: String,
-    pub reference: String,
+    pub contract_id: String,
+    pub contract_hash: String,
     pub decision_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_ref: Option<String>,
@@ -144,6 +145,87 @@ pub struct AuthorityRecord {
 pub enum SealError {
     #[error("seal hash mismatch: sealed transaction was modified")]
     Tampered,
+    #[error("sealed transaction changed after sealing: {}", .0.join(", "))]
+    Changed(Vec<String>),
+}
+
+/// The immutable pins of a sealed transaction. Each is a content hash of one part of what
+/// was authorized; once SEALED none of them can change. A modified transaction is a new
+/// version, planned and sealed again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SealPins {
+    /// The published flow version (name, version, content hash).
+    pub flow: FlowRef,
+    /// `name@version#hash` of every pinned runtime policy.
+    pub policy_refs: Vec<String>,
+    /// Hash of the effective policy (references and combined spec).
+    pub policy_hash: String,
+    /// Hash of the authority reference and the authority decision.
+    pub authority_hash: String,
+    /// Hash of the forward action graph: resolved forward nodes and the edges between them.
+    pub action_graph_hash: String,
+    /// Hash of the recovery graph: recovery nodes, trigger/compensation/recovery edges and the
+    /// commit-violation entries.
+    pub recovery_graph_hash: String,
+    /// Hash of the whole plan (inputs, intent, adapters, guarantees, …).
+    pub plan_hash: String,
+}
+
+impl SealPins {
+    pub fn compute(plan: &TransactionPlan, authority: &AuthorityRecord) -> Self {
+        let spec = &plan.document.spec;
+        let is_forward = |id: &str| {
+            plan.nodes
+                .get(id)
+                .is_some_and(|n| n.spec.phase == crate::flow::Phase::Forward)
+        };
+        let forward_nodes: Vec<_> = plan.nodes.values().filter(|n| is_forward(&n.spec.id)).collect();
+        let forward_edges: Vec<_> = spec
+            .edges
+            .iter()
+            .filter(|e| is_forward(&e.from) && is_forward(&e.to))
+            .collect();
+        let recovery_nodes: Vec<_> = plan.nodes.values().filter(|n| !is_forward(&n.spec.id)).collect();
+        let recovery_edges: Vec<_> = spec
+            .edges
+            .iter()
+            .filter(|e| !is_forward(&e.from) || !is_forward(&e.to))
+            .collect();
+        Self {
+            flow: plan.flow.clone(),
+            policy_refs: plan.policy.refs.clone(),
+            policy_hash: hash_of(&plan.policy),
+            authority_hash: hash_of(authority),
+            action_graph_hash: hash_of(&(forward_nodes, forward_edges, &spec.commit.requires)),
+            recovery_graph_hash: hash_of(&(recovery_nodes, recovery_edges, &spec.commit.on_violation)),
+            plan_hash: plan.plan_hash.clone(),
+        }
+    }
+
+    /// Names of the pins that differ between `self` and `other`.
+    pub fn changed(&self, other: &SealPins) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.flow != other.flow {
+            out.push("flow version");
+        }
+        if self.policy_refs != other.policy_refs || self.policy_hash != other.policy_hash {
+            out.push("policy version");
+        }
+        if self.authority_hash != other.authority_hash {
+            out.push("authority reference");
+        }
+        if self.action_graph_hash != other.action_graph_hash {
+            out.push("action graph");
+        }
+        if self.recovery_graph_hash != other.recovery_graph_hash {
+            out.push("recovery graph");
+        }
+        if self.plan_hash != other.plan_hash {
+            out.push("plan");
+        }
+        out
+    }
 }
 
 /// A sealed transaction. There is deliberately no mutating API: changes go through
@@ -153,6 +235,7 @@ pub enum SealError {
 pub struct SealedTransaction {
     id: TransactionId,
     version: u32,
+    pins: SealPins,
     plan: TransactionPlan,
     authority: AuthorityRecord,
     seal_hash: String,
@@ -163,21 +246,25 @@ pub struct SealedTransaction {
 struct SealContent<'a> {
     id: &'a TransactionId,
     version: u32,
+    pins: &'a SealPins,
     plan: &'a TransactionPlan,
     authority: &'a AuthorityRecord,
 }
 
 impl SealedTransaction {
     pub fn seal(id: TransactionId, version: u32, plan: TransactionPlan, authority: AuthorityRecord) -> Self {
+        let pins = SealPins::compute(&plan, &authority);
         let seal_hash = hash_of(&SealContent {
             id: &id,
             version,
+            pins: &pins,
             plan: &plan,
             authority: &authority,
         });
         Self {
             id,
             version,
+            pins,
             plan,
             authority,
             seal_hash,
@@ -190,6 +277,9 @@ impl SealedTransaction {
     pub fn version(&self) -> u32 {
         self.version
     }
+    pub fn pins(&self) -> &SealPins {
+        &self.pins
+    }
     pub fn plan(&self) -> &TransactionPlan {
         &self.plan
     }
@@ -200,10 +290,17 @@ impl SealedTransaction {
         &self.seal_hash
     }
 
+    /// Recomputes every pin and the seal hash from the content.
     pub fn verify(&self) -> Result<(), SealError> {
+        let pins = SealPins::compute(&self.plan, &self.authority);
+        let changed = self.pins.changed(&pins);
+        if !changed.is_empty() {
+            return Err(SealError::Changed(changed.iter().map(|s| s.to_string()).collect()));
+        }
         let expected = hash_of(&SealContent {
             id: &self.id,
             version: self.version,
+            pins: &self.pins,
             plan: &self.plan,
             authority: &self.authority,
         });
@@ -253,7 +350,8 @@ mod tests {
     fn authority() -> AuthorityRecord {
         AuthorityRecord {
             provider: "static".into(),
-            reference: "grant-1".into(),
+            contract_id: "test/demo".into(),
+            contract_hash: "sha256:demo-contract".into(),
             decision_ref: "static:grant-1".into(),
             approval_ref: None,
         }
@@ -359,7 +457,39 @@ mod tests {
         let mut stored = serde_json::to_value(&sealed).unwrap();
         stored["plan"]["intent"]["summary"] = json!("something else");
         let tampered: SealedTransaction = serde_json::from_value(stored).unwrap();
-        assert_eq!(tampered.verify(), Err(SealError::Tampered));
+        assert!(tampered.verify().is_err());
+    }
+
+    #[test]
+    fn seal_pins_name_what_changed() {
+        let v = publish(flow(), None).version().clone();
+        let p = plan(&v, inputs(), &catalog(), &[]).unwrap();
+        let base = SealPins::compute(&p, &authority());
+        assert!(base.changed(&base.clone()).is_empty());
+
+        let mut other_authority = authority();
+        other_authority.contract_hash = "sha256:other-contract".into();
+        assert_eq!(base.changed(&SealPins::compute(&p, &other_authority)), ["authority reference"]);
+
+        let mut forward = p.clone();
+        forward.nodes.get_mut("make").unwrap().spec.risk = crate::model::Risk::High;
+        assert!(base.changed(&SealPins::compute(&forward, &authority())).contains(&"action graph"));
+
+        let mut recovery = p.clone();
+        recovery.nodes.get_mut("undo_make").unwrap().spec.params = json!({"name": "x"});
+        let changed = base.changed(&SealPins::compute(&recovery, &authority()));
+        assert!(changed.contains(&"recovery graph") && !changed.contains(&"action graph"), "{changed:?}");
+
+        let mut policy = p.clone();
+        policy.policy.spec.allow_uncertainty = true;
+        assert!(base.changed(&SealPins::compute(&policy, &authority())).contains(&"policy version"));
+
+        // A sealed transaction whose content was edited after sealing names the change.
+        let sealed = SealedTransaction::seal(TransactionId::derive("h", "n"), 1, p, authority());
+        let mut stored = serde_json::to_value(&sealed).unwrap();
+        stored["plan"]["nodes"]["undo_make"]["spec"]["risk"] = json!("critical");
+        let edited: SealedTransaction = serde_json::from_value(stored).unwrap();
+        assert!(matches!(edited.verify(), Err(SealError::Changed(c)) if c.contains(&"recovery graph".to_string())));
     }
 
     #[test]

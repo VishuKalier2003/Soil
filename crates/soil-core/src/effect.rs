@@ -22,6 +22,22 @@ pub enum Comparison {
     Unknown,
 }
 
+/// How the observed state differs from the expectation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Divergence {
+    /// No divergence: the intended effect is present and correct.
+    None,
+    /// The effect did not happen.
+    NotApplied,
+    /// The effect happened only partly.
+    PartiallyApplied,
+    /// Something happened, but not what was intended (a postcondition is false).
+    AppliedDifferently,
+    /// The actual state could not be established.
+    Unknown,
+}
+
 /// What an action is expected to have done.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +59,7 @@ pub struct PostconditionResult {
 #[serde(rename_all = "camelCase")]
 pub struct EffectComparison {
     pub outcome: Comparison,
+    pub divergence: Divergence,
     /// Presence of the effect as far as it is known. `Partial` also covers "present but not as
     /// expected", i.e. something exists that may need undoing.
     pub presence: Presence,
@@ -54,8 +71,15 @@ pub struct EffectComparison {
 
 impl EffectComparison {
     fn new(outcome: Comparison, presence: Presence, observed: Value, reason: impl Into<String>) -> Self {
+        let divergence = match (outcome, presence) {
+            (Comparison::Unknown, _) => Divergence::Unknown,
+            (_, Presence::Absent) => Divergence::NotApplied,
+            (_, Presence::Partial) => Divergence::PartiallyApplied,
+            _ => Divergence::None,
+        };
         Self {
             outcome,
+            divergence,
             presence,
             postconditions: vec![],
             observed,
@@ -133,21 +157,29 @@ pub fn compare(expected: &ExpectedEffect, observation: &AdapterResult, ctx: &Val
             .map(|r| r.expr.as_str())
             .collect()
     };
-    let (outcome, presence, reason) = match verdict {
-        Truth::True => (Comparison::Matched, Presence::Present, "effect present; postconditions hold".to_string()),
+    let (outcome, divergence, presence, reason) = match verdict {
+        Truth::True => (
+            Comparison::Matched,
+            Divergence::None,
+            Presence::Present,
+            "effect present; postconditions hold".to_string(),
+        ),
         Truth::False => (
             Comparison::Diverged,
+            Divergence::AppliedDifferently,
             Presence::Partial,
             format!("postconditions false: {}", pick(Truth::False).join("; ")),
         ),
         Truth::Unknown => (
             Comparison::Unknown,
+            Divergence::Unknown,
             Presence::Present,
             format!("postconditions UNKNOWN: {}", pick(Truth::Unknown).join("; ")),
         ),
     };
     EffectComparison {
         outcome,
+        divergence,
         presence,
         postconditions: results,
         observed: state,
@@ -207,6 +239,9 @@ mod tests {
         }
         let c = compare(&expected(), &observed(Presence::Present, json!({"image": "app:3", "ready": true})), &ctx());
         assert_eq!(c.presence, Presence::Partial);
+        assert_eq!(c.divergence, Divergence::AppliedDifferently);
+        let absent = compare(&expected(), &observed(Presence::Absent, Value::Null), &ctx());
+        assert_eq!(absent.divergence, Divergence::NotApplied);
         assert!(c.reason.contains("observed.image == params.image"));
     }
 

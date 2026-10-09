@@ -1,0 +1,150 @@
+# deploy → shift traffic → verify SLO, with a recovery graph declared up front.
+#
+# If the SLO is violated (or any forward action fails or becomes UNCERTAIN), Soil does not
+# "roll back" blindly. It observes what is actually in place, classifies how it diverges from
+# what each action intended, and runs only the predeclared recovery for effects that exist:
+#
+#   restore traffic (the `traffic-failback` compensation flow) → roll back the deployment
+#   → verify the deployment → verify the SLO → RECOVERED
+#
+# Every compensation is declared here, before execution; nothing is invented after failure.
+apiVersion: soil.dev/v1alpha1
+kind: Flow
+metadata:
+  name: canary-release
+  description: Release a new image behind a canary traffic shift; commit only once the SLO holds.
+spec:
+  intent:
+    summary: "Release ${inputs.image} to ${inputs.service} at ${inputs.canary_weight}% canary"
+    actor: agent:releaser
+    principal: team:platform
+    inputs:
+      image: {required: true, description: Image to release}
+      service: {default: checkout}
+      canary_weight: {default: 25, description: Share of traffic sent to the new image}
+
+  # AgentScript/Crane authorizes; Soil consumes the result for exactly this contract version.
+  authority:
+    provider: crane
+    contractId: platform/canary-release
+    contractHash: "sha256:3f5a0c1e9b7d24c68e1f0a2b4c6d8e0f1a3b5c7d9e1f2a4b6c8d0e2f4a6b8c0d"
+
+  policies: [canary-guardrails]
+
+  guarantees:
+    require: [compensatable, verified, reconcilable]
+
+  adapters:
+    k8s: {type: kubernetes, version: 1, config: {region: eu-west-1}}
+    slo: {type: http, version: 1}
+
+  nodes:
+    # forward -----------------------------------------------------------------------------------
+    - id: observe_baseline
+      kind: OBSERVE
+      label: Observe baseline
+      adapter: k8s
+      operation: deployment.status
+      resource: "k8s://prod/${inputs.service}/deployment/api"
+      ui: {x: 0, y: 80}
+    - id: deploy
+      kind: ACTION
+      label: Deploy
+      adapter: k8s
+      operation: deployment.rollout
+      resource: "k8s://prod/${inputs.service}/deployment/api"
+      params: {image: "${inputs.image}"}
+      risk: high
+      recovery:
+        compensation: rollback_deployment
+        # A rollout that timed out may be dispatched again, but only after observation has
+        # confirmed the first attempt did not land (same idempotency key).
+        retry: {maxAttempts: 2}
+      ui: {x: 230, y: 80}
+    - id: shift_traffic
+      kind: ACTION
+      label: Shift traffic
+      adapter: k8s
+      operation: traffic.shift
+      resource: "k8s://prod/${inputs.service}/traffic/api"
+      params: {canary_weight: "${inputs.canary_weight}"}
+      risk: high
+      recovery: {compensation: restore_traffic}
+      ui: {x: 460, y: 80}
+    - id: verify_slo
+      kind: VERIFY
+      label: Verify SLO
+      adapter: slo
+      operation: get
+      resource: "https://slo.test/${inputs.service}"
+      checks: ["observed.error_rate < 0.01", "observed.p99_ms < 300"]
+      ui: {x: 690, y: 80}
+
+    # recovery (declared before execution) --------------------------------------------------------
+    - id: observe_actual
+      kind: OBSERVE
+      phase: recovery
+      label: Observe actual state
+      adapter: k8s
+      operation: deployment.status
+      resource: "k8s://prod/${inputs.service}/deployment/api"
+      ui: {x: 0, y: 320}
+    - id: restore_traffic
+      kind: COMPENSATE
+      phase: recovery
+      label: Restore traffic
+      # A compensation flow: a published flow, pinned at plan time, run as a nested transaction.
+      flow:
+        name: traffic-failback
+        version: 1
+        inputs:
+          service: "${inputs.service}"
+          canary_weight: "${target.observed.previous_canary}"
+      ui: {x: 230, y: 320}
+    - id: rollback_deployment
+      kind: COMPENSATE
+      phase: recovery
+      label: Roll back deployment
+      adapter: k8s
+      operation: deployment.rollback
+      resource: "k8s://prod/${inputs.service}/deployment/api"
+      params: {image: "${target.observed.previous_image}"}
+      ui: {x: 460, y: 320}
+    - id: verify_deployment
+      kind: VERIFY
+      phase: recovery
+      label: Verify deployment
+      adapter: k8s
+      operation: deployment.status
+      resource: "k8s://prod/${inputs.service}/deployment/api"
+      checks: ["observed.image == facts.observe_baseline.image"]
+      ui: {x: 690, y: 320}
+    - id: verify_slo_recovered
+      kind: VERIFY
+      phase: recovery
+      label: Verify SLO recovered
+      adapter: slo
+      operation: get
+      resource: "https://slo.test/${inputs.service}"
+      checks: ["observed.error_rate < 0.01", "observed.p99_ms < 300"]
+      ui: {x: 920, y: 320}
+
+  edges:
+    - {from: observe_baseline, to: deploy, type: DEPENDS_ON}
+    - {from: deploy, to: shift_traffic, type: ON_SUCCESS}
+    - {from: shift_traffic, to: verify_slo, type: DEPENDS_ON}
+    - {from: verify_slo, to: deploy, type: VERIFIES}
+    - {from: verify_slo, to: shift_traffic, type: VERIFIES}
+
+    - {from: deploy, to: observe_actual, type: ON_FAILURE}
+    - {from: shift_traffic, to: observe_actual, type: ON_FAILURE}
+    - {from: verify_slo, to: observe_actual, type: ON_FAILURE}
+
+    - {from: observe_actual, to: restore_traffic, type: DEPENDS_ON}
+    - {from: restore_traffic, to: rollback_deployment, type: DEPENDS_ON}
+    - {from: rollback_deployment, to: verify_deployment, type: DEPENDS_ON}
+    - {from: verify_deployment, to: verify_slo_recovered, type: DEPENDS_ON}
+
+  commit:
+    requires: [verify_slo]
+    onViolation: [observe_actual]

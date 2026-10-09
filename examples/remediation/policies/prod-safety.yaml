@@ -9,3 +9,11 @@ spec:
   requireVerificationAtOrAbove: medium
   requireApprovalAtOrAbove: high
   maxReconcileAttempts: 3
+  constraints:
+    maxReplicas: 20
+    allowedRegions: [eu-west-1]
+    requireVerification: true
+    requireCompensation: true
+    permittedAdapters: [github, kubernetes, ci, http]
+    maxActionCount: 10
+    maxExecutionDuration: 30m

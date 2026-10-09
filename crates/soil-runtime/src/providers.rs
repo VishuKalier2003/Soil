@@ -25,7 +25,9 @@ pub struct AuthorityRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum AuthorityDecision {
-    Granted { decision_ref: String },
+    /// Authorized. `contract_hash` is the contract version the authority evaluated; Soil refuses
+    /// a grant for any contract other than the one the transaction is bound to.
+    Granted { decision_ref: String, contract_hash: String },
     Denied { reason: String },
     /// The authority wants a human (or policy) approval before granting.
     RequiresApproval { reason: String },
@@ -50,6 +52,9 @@ pub struct ApprovalRequest {
 pub enum ApprovalDecision {
     Approved { by: String, reference: String },
     Denied { by: String, reason: String },
+    /// Not decided yet. The engine pauses (WAITING_APPROVAL, or the APPROVAL node stays READY)
+    /// and returns; resuming later asks again.
+    Pending { reason: String },
 }
 
 pub trait ApprovalProvider: Send + Sync {
@@ -86,18 +91,22 @@ impl AuthorityProvider for StaticAuthority {
             AuthorityDecision::Granted {
                 decision_ref: format!(
                     "static:{}:{}",
-                    request.authority.reference,
+                    request.authority.contract_id,
                     &request.plan_hash[..12.min(request.plan_hash.len())]
                 ),
+                contract_hash: request.authority.contract_hash.clone(),
             }
         }
     }
 }
 
-/// Development approvals: approves the listed nodes (or everything).
+/// Development approvals: approves the listed keys (node ids, or `transaction` for the
+/// transaction-level approval) or everything. Unlisted requests are denied, or left pending when
+/// `defer_unlisted` is set.
 pub struct StaticApprovals {
     pub approve_all: bool,
     pub approved: BTreeSet<String>,
+    pub defer_unlisted: bool,
     pub by: String,
 }
 
@@ -106,15 +115,25 @@ impl StaticApprovals {
         Self {
             approve_all: true,
             approved: BTreeSet::new(),
+            defer_unlisted: false,
             by: by.into(),
         }
     }
 
-    pub fn only(nodes: impl IntoIterator<Item = String>, by: &str) -> Self {
+    pub fn only(keys: impl IntoIterator<Item = String>, by: &str) -> Self {
         Self {
             approve_all: false,
-            approved: nodes.into_iter().collect(),
+            approved: keys.into_iter().collect(),
+            defer_unlisted: false,
             by: by.into(),
+        }
+    }
+
+    /// Approves the listed keys; everything else stays pending (the run pauses).
+    pub fn deferred(keys: impl IntoIterator<Item = String>, by: &str) -> Self {
+        Self {
+            defer_unlisted: true,
+            ..Self::only(keys, by)
         }
     }
 }
@@ -127,11 +146,26 @@ impl ApprovalProvider for StaticApprovals {
                 by: self.by.clone(),
                 reference: format!("static-approval:{}:{key}", request.transaction_id),
             }
+        } else if self.defer_unlisted {
+            ApprovalDecision::Pending {
+                reason: format!("waiting for an approval of '{key}'"),
+            }
         } else {
             ApprovalDecision::Denied {
                 by: self.by.clone(),
                 reason: format!("no approval recorded for '{key}'"),
             }
+        }
+    }
+}
+
+/// Forwards every event to several sinks, in order.
+pub struct Fanout<'a>(pub Vec<&'a dyn EventSink>);
+
+impl EventSink for Fanout<'_> {
+    fn on_event(&self, record: &EvidenceRecord, run: &TransactionRun) {
+        for sink in &self.0 {
+            sink.on_event(record, run);
         }
     }
 }

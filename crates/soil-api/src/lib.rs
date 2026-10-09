@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use soil_adapters::sim::{SimScenario, SimWorld};
 use soil_core::document::{from_value, resolve_adapter_refs, validate_adapter_config, validate_policy, AdapterConfigDocument};
 use soil_core::flow::FlowDocument;
-use soil_core::plan::plan;
+use soil_core::plan::plan_with;
 use soil_core::policy::{EffectivePolicy, PolicyDocument, PolicyVersion};
 use soil_core::state::{PolicyState, State as _};
 use soil_core::transaction::{FlowVersion, PublishOutcome, TransactionId};
@@ -71,6 +71,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/transactions/{id}/events/stream", get(stream_events))
         .route("/v1/transactions/{id}/recovery", get(get_recovery))
         .route("/v1/transactions/{id}/recover", post(recover_run))
+        .route("/v1/transactions/{id}/resume", post(resume_run))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
@@ -441,17 +442,23 @@ struct StartRun {
     /// Simulated provider latency per request, so the dashboard can follow along.
     #[serde(default)]
     latency_ms: Option<u64>,
+    /// Leave approvals that were not given pending: the run pauses until `/resume`.
+    #[serde(default)]
+    defer_approvals: bool,
 }
 
-fn approvals_from(v: &Option<Value>) -> StaticApprovals {
+/// `None`/`"all"` approves everything; a list approves those keys (node ids or `transaction`).
+/// With `defer`, anything not approved stays pending and the run pauses.
+fn approvals_from(v: &Option<Value>, defer: bool) -> StaticApprovals {
+    let listed: Vec<String> = match v {
+        Some(Value::Array(ids)) => ids.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+        _ => vec![],
+    };
     match v {
-        None => StaticApprovals::approve_all("dashboard"),
         Some(Value::String(s)) if s == "all" => StaticApprovals::approve_all("dashboard"),
-        Some(Value::Array(ids)) => StaticApprovals::only(
-            ids.iter().filter_map(|x| x.as_str().map(String::from)),
-            "dashboard",
-        ),
-        Some(_) => StaticApprovals::only([], "dashboard"),
+        None if !defer => StaticApprovals::approve_all("dashboard"),
+        _ if defer => StaticApprovals::deferred(listed, "dashboard"),
+        _ => StaticApprovals::only(listed, "dashboard"),
     }
 }
 
@@ -478,7 +485,13 @@ async fn start_run(State(s): State<AppState>, Path(p): Path<String>, Json(req): 
         };
         let mut inputs = scenario.spec.inputs.clone();
         inputs.extend(req.inputs.clone());
-        let plan = plan(&version, inputs, &soil_adapters::catalog(), &project.policy_versions())
+        let plan = plan_with(
+            &version,
+            inputs,
+            &soil_adapters::catalog(),
+            &project.policy_versions(),
+            &project.flow_versions(),
+        )
             .map_err(|e| ApiError::Invalid(json!({"error": e.to_string()})))?;
         store.counter += 1;
         let nonce = format!("{}:{}", SystemClock.now_ms(), store.counter);
@@ -491,12 +504,12 @@ async fn start_run(State(s): State<AppState>, Path(p): Path<String>, Json(req): 
     };
 
     let state = s.clone();
-    let sim = Arc::new(SimWorld::new(
+    let sim = Arc::new(SimWorld::with_rules(
         scenario.spec.world.clone(),
-        scenario.spec.faults.iter().map(|(k, f)| (k.clone(), f.list())).collect(),
+        scenario.spec.faults.iter().map(|(k, f)| (k.clone(), f.rules())).collect(),
         req.latency_ms.unwrap_or(150),
     ));
-    let approvals = approvals_from(&req.approvals);
+    let approvals = approvals_from(&req.approvals, req.defer_approvals);
     let auto_recover = req.auto_recover.unwrap_or(true);
     let run_id = id.to_string();
     let response = json!({"id": run_id});
@@ -513,7 +526,7 @@ async fn start_run(State(s): State<AppState>, Path(p): Path<String>, Json(req): 
             options: EngineOptions { auto_recover },
         };
         let outcome = engine.run(plan, id);
-        state.finish_run(&run_id, outcome.map(|r| (r.sealed, r.run)), sim.snapshot());
+        state.finish_run(&run_id, outcome.map(|r| (r.sealed, r.run)), sim.snapshot_with_faults());
     });
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
@@ -613,6 +626,61 @@ async fn stream_events(State(s): State<AppState>, Path(id): Path<String>) -> Api
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResumeRequest {
+    #[serde(default)]
+    approvals: Option<Value>,
+    #[serde(default)]
+    defer_approvals: bool,
+}
+
+/// Continues a paused (or halted) transaction from its persisted state, e.g. once an approval
+/// has been granted. Never modifies the sealed definition: resume refuses any changed pin.
+async fn resume_run(State(s): State<AppState>, Path(id): Path<String>, Json(req): Json<ResumeRequest>) -> ApiResult<Json<Value>> {
+    let (plan, run, world, faults) = {
+        let store = s.lock();
+        let r = store.run(&id)?;
+        if !r.done {
+            return Err(ApiError::Conflict("transaction is still executing".into()));
+        }
+        (
+            r.plan.clone(),
+            r.run.clone().ok_or_else(|| ApiError::Conflict("no run state".into()))?,
+            r.world.clone().unwrap_or_default(),
+            r.faults.clone(),
+        )
+    };
+    let approvals = approvals_from(&req.approvals, req.defer_approvals);
+    let state = s.clone();
+    let run_id = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let sim = Arc::new(SimWorld::with_rules(world, faults, 0));
+        let registry = soil_adapters::registry(sim.clone());
+        let sink = store::ApiSink::new(state.clone(), &run_id);
+        let authority = StaticAuthority::grant_all();
+        let engine = Engine {
+            adapters: &registry,
+            clock: &SystemClock,
+            authority: &authority,
+            approvals: &approvals,
+            sink: &sink,
+            options: EngineOptions::default(),
+        };
+        (engine.resume(&plan, run), sim.snapshot_with_faults())
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    match result {
+        (Ok(r), world) => {
+            let summary = json!({"id": r.run.id, "state": r.run.state, "awaiting": r.run.awaiting});
+            s.store_resumed(&id, r.sealed, r.run, world);
+            Ok(Json(summary))
+        }
+        (Err(e), _) => Err(ApiError::Conflict(e.to_string())),
+    }
+}
+
+#[derive(Deserialize)]
 struct RecoverRequest {
     #[serde(default)]
     resolve: Option<String>,
@@ -650,7 +718,7 @@ async fn recover_run(State(s): State<AppState>, Path(id): Path<String>, Json(req
     let state = s.clone();
     let run_id = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let sim = Arc::new(SimWorld::new(world, faults, 0));
+        let sim = Arc::new(SimWorld::with_rules(world, faults, 0));
         let registry = soil_adapters::registry(sim.clone());
         let sink = store::ApiSink::new(state.clone(), &run_id);
         let approvals = StaticApprovals::approve_all("dashboard");
@@ -667,7 +735,7 @@ async fn recover_run(State(s): State<AppState>, Path(id): Path<String>, Json(req
             Some(outcome) => engine.resolve(&sealed, run, &Resolution { outcome, operator: req.operator, note: req.note }),
             None => engine.recover(&sealed, run),
         };
-        (out, sim.snapshot())
+        (out, sim.snapshot_with_faults())
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;

@@ -42,7 +42,7 @@ tool call.
 | `operation` | adapter operation (`kubernetes:deployment.rollout`) |
 | `resource` | normalized target (`k8s://prod-eu/checkout/deployment/api`) |
 | `context` | non-secret parameters; `secretRef`s are references, never values |
-| `authority` | reference to the Crane grant covering this action (opaque to Soil) |
+| `authority` | the external authority contract (provider, contract id, contract hash), see §11 |
 | `preconditions` | expressions that must be TRUE before dispatch (UNKNOWN blocks) |
 | `expectedEffect` | `{kind: none/create/update/delete/external, summary}` |
 | `postconditions` | expressions over `observed` that must be TRUE after the effect |
@@ -63,7 +63,7 @@ A **TransactionDefinition** (from a Flow version) contains:
 - immutable **intent** (summary, principal, actor, inputs)
 - **action graph** (nodes + typed edges, forward phase)
 - **dependencies** (forward edges)
-- **authority reference** (Crane grant / provider + reference)
+- **authority reference** (provider, contract id, contract hash; §11)
 - **invariants**
 - **guarantee requirements**
 - **verification rules** (VERIFY nodes + per-action verification)
@@ -119,7 +119,8 @@ spec:
 ```
 
 Policies are versioned and have a lifecycle (Policy machine). A sealed transaction pins
-policy versions.
+policy versions. Policies also carry **transaction constraints** and named **parameters**
+(§11).
 
 An **Invariant** is a deterministic expression with a scope:
 `scope: commit` (evaluated at the commit boundary) or `scope: checkpoint:<node>`
@@ -214,7 +215,7 @@ transition is appended to the evidence chain.
 | SEALED | READY, BLOCKED, CANCELLED, EXPIRED |
 | READY | EXECUTING, BLOCKED, CANCELLED, EXPIRED |
 | EXECUTING | OBSERVING, FAILED, UNCERTAIN |
-| OBSERVING | VERIFIED, FAILED, UNCERTAIN |
+| OBSERVING | VERIFIED, FAILED, UNCERTAIN, READY (declared retry, only after observation confirmed the effect absent) |
 | UNCERTAIN | OBSERVING, MANUAL_INTERVENTION |
 | VERIFIED | SUCCEEDED |
 | SUCCEEDED | COMPENSATION_PENDING |
@@ -460,6 +461,10 @@ transports implement the same `Transport` trait; the adapters' normalization doe
 | Unit — adapters | normalization, descriptor completeness, sim fault behaviours | `soil-adapters/src/sim/tests.rs` |
 | Contract — adapters | every operation: result kinds per method, input/output schema conformance, timeouts are UNCERTAIN | `soil-adapters/tests/contract.rs` |
 | Unit — effect comparison | MATCHED / DIVERGED (absent, partial, false postcondition) / UNKNOWN | `soil-core/src/effect.rs` |
+| Integration — engine | exact lifecycle with WAITING_APPROVAL; commit only after final verification; every node type; topological scheduling; pause/resume at transaction and node approvals; seal pins enforced on resume; durable journal repair; **crash after every journal position and resume** (happy path and recovery) | `soil-runtime/tests/engine.rs` |
+| Integration — CLI restart | kill with `--crash-after`, `soil transaction resume`; in-flight request never re-sent; deferred approvals | `soil-cli/tests/cli.rs` |
+| Integration — policy | invariant violations (commit, `always`, checkpoint) prevent commit; UNKNOWN blocks unless policy *and* invariant allow it; advisory invariants; every constraint (static, dispatch, deadline); contract-bound authority | `soil-runtime/tests/policy.rs` |
+| Unit — constraints & expressions | `in`, lists, durations; dimension and static constraint checks; most-restrictive combination | `soil-core/src/{expr,constraints}.rs` |
 | Integration — effects | successful action; failed action; timeout → reconciled success; timeout → confirmed failure; divergence; successful verification; invalid inputs never dispatched | `soil-runtime/tests/effects.rs` |
 | Integration — runtime | remediation flow: happy commit; timeout-but-applied reconciled and committed; partial failure recovered; SLO violation compensated; compensation failure → PARTIALLY_RECOVERED/MANUAL; unresolvable uncertainty → MANUAL_INTERVENTION; determinism (two runs → identical evidence hashes); no retries (adapter call counts) | `soil-runtime/tests/remediation.rs` |
 | Integration — CLI | init → validate → publish → plan → run → status → inspect | `soil-cli/tests/cli.rs` |
@@ -518,3 +523,249 @@ retried); still unknown → escalation. Contract violations (`execute` returning
 
 The comparison (with every postcondition's result) is stored on the node (`NodeRun.comparison`)
 and recorded in the evidence of the effect transition it caused.
+
+---
+
+## 10. Execution engine: lifecycle, sealing, journal and restart
+
+Soil executes **transaction semantics** over one sealed, versioned action graph. It is not a
+general-purpose workflow scheduler. There are no cron triggers, queues, timers, retries or
+long-lived workers, and nothing runs outside a transaction.
+
+### Lifecycle
+
+```
+DRAFT → PLANNED → PROPOSED → [WAITING_APPROVAL →] AUTHORIZING → AUTHORIZED → SEALED
+      → EXECUTING → VERIFYING → COMMITTED
+                 ↘ FAILED / UNCERTAIN → RECOVERING → [COMPENSATING →] RECOVERED | PARTIALLY_RECOVERED | MANUAL_INTERVENTION
+```
+
+`WAITING_APPROVAL` is entered when the authority provider (Crane) requires an approval. If the
+approval provider answers `Pending`, the engine **pauses**: it returns with the run persisted in
+`WAITING_APPROVAL` and `awaiting = ["transaction"]`. `Engine::resume` asks again later. APPROVAL
+nodes pause the same way: the node stays `READY`, `awaiting` names it, nothing downstream is
+dispatched, and independent branches keep running until only waiting nodes remain.
+
+`COMMITTED` is reachable only from `VERIFYING`, which is entered only after every forward node
+has succeeded. `VERIFYING` checks the commit boundary (`commit.requires`) and the commit invariants.
+
+### Sealing and immutable pins
+
+At `SEALED` the engine records `SealPins` (in the run and in the `SEALED` evidence record):
+
+| Pin | Content hashed |
+|---|---|
+| `flow` | published flow name, version and content hash |
+| `policyRefs` / `policyHash` | pinned policy versions and the effective policy |
+| `authorityHash` | authority reference and the decision (and approval) reference |
+| `actionGraphHash` | resolved forward nodes, the edges between them, the commit boundary |
+| `recoveryGraphHash` | recovery nodes, trigger/compensation/recovery edges, `commit.onViolation` |
+| `planHash` | the whole plan |
+
+The seal hash covers the pins and the full plan. `Engine::resume` recomputes every pin from the
+plan it is given and refuses to continue (`SealError::Changed([...])`) if any differ, naming
+the component that changed. A modified transaction must be amended into a new version.
+
+### Journal and write-ahead rule
+
+Every transition calls the event sink before the engine acts on it. `FileJournal` makes each event
+durable before returning: it atomically replaces `run.json` (the full run state) and appends
+the evidence record to `journal.jsonl`. In particular, a node's `EXECUTING` transition (with
+its rendered invocation and idempotency key) is durable **before** the adapter is called.
+
+### Restart semantics
+
+`Engine::resume(plan, run)` drives the transaction from its persisted state. Every step is
+idempotent with respect to the persisted state. Node progressions use the shortest legal
+path in the transition tables and never route through operator-only states
+(MANUAL_INTERVENTION, BLOCKED). Nodes caught mid-flight are finished as follows:
+
+| Persisted node state | On restart |
+|---|---|
+| `READY` | continue admission (approval, compensation bookkeeping) and dispatch |
+| `EXECUTING` (adapter node) | outcome unknown → `UNCERTAIN(interrupted)` → reconcile by observation; **never re-sent** |
+| `EXECUTING` (inline node) | re-evaluate (pure) |
+| `OBSERVING` / `UNCERTAIN` | observe again and compare EXPECTED vs OBSERVED |
+| `VERIFIED` | → `SUCCEEDED` |
+
+So a request that reached the provider before the crash is confirmed by observation and the
+transaction proceeds as if nothing happened. A request that never left becomes a *confirmed
+failure* and the declared recovery runs. In both cases it is dispatched at most once. Recovery is
+itself resumable at every recovery state; a recovery found already final carries the
+transaction to the matching state; final bookkeeping (guarantee evaluation, cancelling unused
+recovery nodes) is completed if a stop cut it short.
+
+### Deterministic topological scheduling
+
+Within a phase, a node is ready when all of its dependencies are resolved (`DEPENDS_ON`,
+`ON_SUCCESS`, `TRIGGERS`, `GUARDS`, and `VERIFIES` reversed). Ready nodes form a wave, ordered
+by node id and bounded by `maxParallelism`. Adapter calls in a wave may overlap; their results
+are applied in node-id order. `JOIN` waits for all branches and is skipped only if all were
+skipped; `SPLIT` is an explicit fan-out; `CONDITION` decides `GUARDS`; `CHECKPOINT` evaluates its
+scoped invariants; `APPROVAL` asks the approval provider. Given the same adapter responses the
+evidence is bit-for-bit identical. The mocked providers are deterministic even for concurrent
+requests.
+
+---
+
+## 11. Authority, policy constraints and invariants
+
+### External authority
+
+Soil does not authorize. Authorization and agent governance stay with AgentScript/Crane:
+
+```yaml
+authority:
+  provider: crane
+  contractId: platform/ship-fix
+  contractHash: "sha256:…"      # the exact contract version this flow is bound to
+```
+
+The engine sends the authority provider the contract reference, intent, plan hash, maximum risk
+and operations. It **consumes** the result (`Granted { decisionRef, contractHash }`, `Denied`,
+`RequiresApproval`). A grant for a different `contractHash` than the one the transaction is
+bound to is refused, and the transaction is `ABORTED` before anything is sealed or dispatched.
+The authority record (provider, contract id, contract hash, decision, approval) is pinned in the
+seal (`authorityHash`).
+
+### Transaction constraints
+
+Constraints live in runtime policies (`spec.constraints`). Several pinned policies combine to the
+most restrictive values. They bound what one transaction may do:
+
+| Constraint | Enforced |
+|---|---|
+| `permittedAdapters` | statically: every adapter used must be listed |
+| `maxActionCount` | statically: effectful forward actions |
+| `requireVerification` | statically: every effectful action read-back verified or VERIFIED by a node |
+| `requireCompensation` | statically: every effectful action has a declared compensation (or is ephemeral) |
+| `maxSpend` | statically: sum of declared node `cost`s (forward and recovery), one currency |
+| `maxReplicas` | at plan time when the value is known from literals/inputs, else at dispatch |
+| `allowedRegions` | at plan time when known (binding config), else at dispatch |
+| `maxExecutionDuration` | during execution: checked before every wave from `EXECUTING` onwards |
+
+`maxReplicas` and `allowedRegions` apply to operation **dimensions**: adapters declare where the
+value comes from (`kubernetes.*: region ← config.region`, `deployment.rollout: replicas ←
+params.replicas`, optional). An action violating a constraint is `BLOCKED` and **never
+dispatched**. A required dimension whose value cannot be determined is UNKNOWN, which also blocks.
+Constraints never block recovery, because undoing an effect must stay possible. When the execution
+deadline elapses, every undispatched forward action becomes `EXPIRED` and the transaction fails
+with class `timeout` into the declared `commit.onViolation` recovery.
+
+### Invariants
+
+```yaml
+aliases: {deployment: facts.deploy, checkout: facts.verify}
+invariants:
+  - {id: replica_cap,      scope: always, expr: "deployment.replicas <= 50"}
+  - {id: approved_cluster,                expr: "deployment.cluster in allowed_clusters"}   # policy parameter
+  - {id: latency_budget,                  expr: "checkout.p95_latency < 500ms"}
+```
+
+* Expression roots: `inputs`, `facts`, `tx`, `policy` (constraints and parameters), policy
+  parameters by name, and flow `aliases`. The language adds `in`, list literals and duration
+  literals (`500ms`, `2s`, `1m`, `1h`, compared in milliseconds; observed strings such as
+  `"420ms"` compare the same way).
+* Scopes: `commit` (at the commit boundary), `always` (after every forward wave, where a
+  required violation stops execution immediately, and again at commit), `checkpoint:<node>`.
+* States: `PENDING → EVALUATING → SATISFIED | VIOLATED | UNKNOWN` (re-evaluation goes back
+  through `EVALUATING`; between waves an unchanged result is not re-recorded).
+* Severity: `required` (default) blocks; `advisory` is recorded and degrades the guarantee.
+* **UNKNOWN is conservative.** A required invariant that is UNKNOWN blocks commit (the
+  transaction becomes `UNCERTAIN` and recovers). The only exception is when the effective policy
+  says `allowUncertainty: true` **and** the invariant says `onUnknown: allow`. The transaction
+  then commits with guarantee `UNPROVABLE`.
+
+## 12. Recovery and compensation
+
+Recovery is not a rollback button. It acts on **observed external state**, using only paths
+declared before the transaction was sealed. No LLM, and no other source of new plans, is
+consulted after a failure.
+
+### Declaring recovery
+
+Every flow carries its recovery graph (`phase: recovery` nodes and their edges). Each forward
+action may additionally declare:
+
+```yaml
+- id: deploy
+  kind: ACTION
+  recovery:
+    strategy: compensate          # compensate (default when a compensation exists) | retain | manual
+    compensation: rollback_deployment   # a COMPENSATE node (same as a COMPENSATES edge)
+    retry: {maxAttempts: 2}       # see "Declared retry"
+
+- id: restore_traffic             # a compensation *flow*
+  kind: COMPENSATE
+  phase: recovery
+  flow: {name: traffic-failback, version: 1, inputs: {canary_weight: "${target.observed.previous_canary}"}}
+```
+
+* `compensate`: undo the effect with its compensation action or compensation flow.
+* `retain`: the effect is intentionally kept. The planner sets atomicity to `best_effort`, so
+  a flow that requires `compensatable` cannot use it.
+* `manual`: a human undoes it. The action goes to `MANUAL_INTERVENTION` and the transaction
+  cannot be `RECOVERED` automatically.
+
+Validation rejects a `recovery.compensation` that is not a COMPENSATE node and a `compensate`
+strategy without a compensation. It rejects a retry on a non-effectful node, on an operation
+that is not idempotent or cannot be observed, and any `maxAttempts` outside 1..=5. A COMPENSATE
+node runs either an adapter operation or a flow. The planner resolves every compensation flow
+to an exact published version, verifies its hash, validates it and pins it, with its policies,
+in the plan. The recovery graph hash then seals it. Compensation flows cannot nest further.
+
+### When an action becomes UNCERTAIN
+
+1. **Stop unsafe downstream operations.** The UNCERTAIN record lists the dependents being held
+   (`holding`). Nothing downstream is dispatched until observation settles the action, and if
+   recovery starts, those dependents are cancelled.
+2. **Observe actual resource state** through the adapter's `observe`. The request itself is
+   never re-sent.
+3. **Classify the divergence.** Every comparison yields a `Divergence`: `none`,
+   `not_applied`, `partially_applied`, `applied_differently` or `unknown`. Recovery records
+   presence and divergence per effect at `CLASSIFYING`.
+4. **Select the predeclared recovery path.** Only compensations whose target effect was
+   observed present or partial are planned. `retain` and `manual` effects are excluded. Effects
+   with no compensation are `uncovered`. The selected plan is recorded at `AUTHORIZED`.
+5. **Execute recovery actions** in deterministic topological order. A compensation flow runs
+   as a nested transaction with its own id, evidence chain and journal file
+   (`subtx-<id>.jsonl`). Its full state is stored on the COMPENSATE node, so a restart resumes
+   it.
+6. **Verify the recovery target.** A compensation that reports success is not trusted. The
+   original effect is observed again, and only an effect observed **absent** becomes
+   `RESTORED` / `COMPENSATED`. Anything else goes to `MANUAL_INTERVENTION` with the observed
+   presence as the reason. Declared recovery VERIFY nodes then check the target state (for
+   example, the image is back and the SLO holds).
+7. **Record the recovery outcome.** The terminal recovery record lists `restored`,
+   `retained`, `manual`, `failedRecoveryNodes`, `uncovered`, `residual` and `divergence`.
+
+### Outcomes
+
+| Outcome | When |
+|---|---|
+| `RECOVERED` | every effect to undo was observed absent after compensation, all recovery VERIFY nodes passed, nothing uncovered, residual or manual |
+| `PARTIALLY_RECOVERED` | some recovery work failed or some effect remains; what was undone is reported as such |
+| `MANUAL_INTERVENTION` | uncertainty could not be resolved, a `manual` strategy applies, or a compensation did not remove the effect |
+| `ABORTED` | observation shows nothing landed, so there is nothing to undo |
+
+### Declared retry
+
+A retry is a declared, bounded re-dispatch, not error handling:
+
+* It applies only after an UNCERTAIN outcome (timeout, lost connection, interrupted executor)
+  **and** after observation has confirmed the effect absent. A confirmed failure, a present or
+  partial effect, or an unknown one is never retried.
+* The action moves `OBSERVING → READY` (the only way back to READY) and is dispatched again
+  with the **same idempotency key**. The effect walks `DIVERGED → RECONCILING → … → MATCHED`
+  if a later attempt lands.
+* At most `1 + maxAttempts` dispatches happen. Retries never happen during recovery.
+* Automatic walks never route through READY, so no other transition can cause a
+  re-dispatch.
+
+### The demo
+
+`examples/canary-release` covers the whole cycle: deploy → shift traffic → SLO violated →
+restore traffic (compensation flow `traffic-failback@1`) → roll back deployment → verify
+deployment → verify SLO → `RECOVERED`. Its scenarios also cover a retried rollout, an
+uncertain partial traffic shift, and a rejected rollback (`PARTIALLY_RECOVERED`). Tests:
+`crates/soil-runtime/tests/recovery.rs`.

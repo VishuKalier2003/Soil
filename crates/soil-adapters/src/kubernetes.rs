@@ -22,6 +22,7 @@ const TRAFFIC: &str = "k8s://{cluster}/{namespace}/traffic/{name}";
 fn deployment_output(with_traffic: bool) -> Schema {
     let mut fields = vec![
         ("name", T::String, true),
+        ("cluster", T::String, false),
         ("image", T::String, true),
         ("previous_image", T::String, false),
         ("config_version", T::String, false),
@@ -46,8 +47,13 @@ fn traffic_output() -> Schema {
 
 const WEIGHT_OK: &str = "params.canary_weight >= 0 && params.canary_weight <= 100";
 
+/// Every effectful Kubernetes operation targets the region of its binding (`config.region`).
+fn regional(op: Op) -> Op {
+    op.dimension("region", "config.region", false)
+}
+
 fn ops() -> Vec<OperationDescriptor> {
-    vec![
+    let ops = vec![
         Op::read(
             PROVIDER,
             "deployment.status",
@@ -55,8 +61,7 @@ fn ops() -> Vec<OperationDescriptor> {
             "kubernetes.deployment",
             DEPLOYMENT,
         )
-        .output(deployment_output(true))
-        .build(),
+        .output(deployment_output(true)),
         Op::write(
             PROVIDER,
             "deployment.rollout",
@@ -66,12 +71,16 @@ fn ops() -> Vec<OperationDescriptor> {
             EffectKind::Update,
             "all replicas run the new image (and config version)",
         )
-        .input(Schema::of(&[("image", T::String, true), ("config_version", T::String, false)]))
+        .input(Schema::of(&[
+            ("image", T::String, true),
+            ("config_version", T::String, false),
+            ("replicas", T::Integer, false),
+        ]))
         .output(deployment_output(false))
         .pre(&["params.image != ''"])
         .post(&["observed.image == params.image", "observed.ready == true"])
         .compensated_by("deployment.rollback", &[("image", "${target.observed.previous_image}")])
-        .build(),
+        .dimension("replicas", "params.replicas", true),
         Op::write(
             PROVIDER,
             "deployment.rollback",
@@ -84,8 +93,7 @@ fn ops() -> Vec<OperationDescriptor> {
         .input(Schema::of(&[("image", T::String, true)]))
         .output(deployment_output(false))
         .pre(&["params.image != ''"])
-        .post(&["observed.image == params.image", "observed.ready == true"])
-        .build(),
+        .post(&["observed.image == params.image", "observed.ready == true"]),
         Op::write(
             PROVIDER,
             "config.restore",
@@ -97,8 +105,7 @@ fn ops() -> Vec<OperationDescriptor> {
         )
         .input(Schema::of(&[("config_version", T::String, true)]))
         .output(deployment_output(false))
-        .post(&["observed.config_version == params.config_version"])
-        .build(),
+        .post(&["observed.config_version == params.config_version"]),
         Op::write(
             PROVIDER,
             "traffic.shift",
@@ -112,8 +119,7 @@ fn ops() -> Vec<OperationDescriptor> {
         .output(traffic_output())
         .pre(&[WEIGHT_OK])
         .post(&["observed.canary == params.canary_weight"])
-        .compensated_by("traffic.restore", &[("canary_weight", "${target.observed.previous_canary}")])
-        .build(),
+        .compensated_by("traffic.restore", &[("canary_weight", "${target.observed.previous_canary}")]),
         Op::write(
             PROVIDER,
             "traffic.restore",
@@ -126,9 +132,9 @@ fn ops() -> Vec<OperationDescriptor> {
         .input(Schema::of(&[("canary_weight", T::Integer, true)]))
         .output(traffic_output())
         .pre(&[WEIGHT_OK])
-        .post(&["observed.canary == params.canary_weight"])
-        .build(),
-    ]
+        .post(&["observed.canary == params.canary_weight"]),
+    ];
+    ops.into_iter().map(|op| regional(op).build()).collect()
 }
 
 pub struct KubernetesAdapter {
@@ -137,6 +143,7 @@ pub struct KubernetesAdapter {
 }
 
 struct Target {
+    cluster: String,
     deployment: String,
     virtual_service: String,
     kind: String,
@@ -149,6 +156,7 @@ fn target(resource: &str) -> Option<Target> {
     }
     let (cluster, ns, kind, name) = (s[0], s[1], s[2], s[3]);
     Some(Target {
+        cluster: cluster.to_string(),
         deployment: format!("/clusters/{cluster}/apis/apps/v1/namespaces/{ns}/deployments/{name}"),
         virtual_service: format!(
             "/clusters/{cluster}/apis/networking.istio.io/v1/namespaces/{ns}/virtualservices/{name}"
@@ -218,6 +226,7 @@ impl KubernetesAdapter {
             Read::NotFound => return Err(absent()),
             Read::Unknown(r) => return Err(r),
         };
+        state["cluster"] = json!(t.cluster);
         state["traffic"] = match self.get(inv, &t.virtual_service) {
             Read::Found(b) => normalize_traffic(&b),
             Read::NotFound => Value::Null,
@@ -273,6 +282,9 @@ impl Adapter for KubernetesAdapter {
                 if let Some(cfg) = param_str(inv, "config_version") {
                     body["metadata"] = json!({"annotations": {CONFIG_ANNOTATION: cfg}});
                 }
+                if let Some(n) = inv.params.get("replicas").and_then(Value::as_u64) {
+                    body["spec"]["replicas"] = json!(n);
+                }
                 (&t.deployment, body, normalize_deployment)
             }
             "config.restore" => {
@@ -297,11 +309,18 @@ impl Adapter for KubernetesAdapter {
             }
             other => return failure(format!("unknown operation '{other}'")),
         };
-        outcome(
+        let result = outcome(
             self.transport
                 .call(&support::request(PROVIDER, inv, "PATCH", path.to_string(), body)),
             normalize,
-        )
+        );
+        match result {
+            AdapterResult::Success { mut state } if t.kind == "deployment" => {
+                state["cluster"] = json!(t.cluster);
+                AdapterResult::Success { state }
+            }
+            other => other,
+        }
     }
 
     fn observe(&self, inv: &Invocation) -> AdapterResult {
@@ -314,11 +333,12 @@ impl Adapter for KubernetesAdapter {
                 Err(r) => r,
             },
             "deployment.rollout" | "deployment.rollback" | "config.restore" => {
-                let state = match self.get(inv, &t.deployment) {
+                let mut state = match self.get(inv, &t.deployment) {
                     Read::Found(b) => normalize_deployment(&b),
                     Read::NotFound => return absent(),
                     Read::Unknown(r) => return r,
                 };
+                state["cluster"] = json!(t.cluster);
                 let presence = if inv.operation == "config.restore" {
                     let applied = param_str(inv, "config_version").is_some_and(|c| state["config_version"] == c);
                     if applied { Presence::Present } else { Presence::Absent }
@@ -338,12 +358,13 @@ impl Adapter for KubernetesAdapter {
                 };
                 let want = inv.params.get("canary_weight").and_then(Value::as_u64);
                 let canary = state["canary"].as_u64();
-                let presence = if canary.is_some() && canary == want {
-                    Presence::Present
-                } else if canary == state["previous_canary"].as_u64() {
-                    Presence::Absent
-                } else {
-                    Presence::Partial
+                // Present: the requested weight. Partial: stuck strictly between where it was and
+                // where it should be. Anything else: the intended shift is not in effect.
+                let previous = state["previous_canary"].as_u64();
+                let presence = match (canary, want, previous) {
+                    (Some(c), Some(w), _) if c == w => Presence::Present,
+                    (Some(c), Some(w), Some(p)) if c > p.min(w) && c < p.max(w) => Presence::Partial,
+                    _ => Presence::Absent,
                 };
                 observed(presence, state)
             }

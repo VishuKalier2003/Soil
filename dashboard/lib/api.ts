@@ -83,9 +83,19 @@ export const api = {
   runs: (p: string) => request<RunSummary[]>("GET", `/v1/projects/${enc(p)}/transactions`),
   startRun: (
     p: string,
-    body: { flow: string; version?: number; scenario?: string; latencyMs?: number; approvals?: "all" | string[]; autoRecover?: boolean },
+    body: {
+      flow: string;
+      version?: number;
+      scenario?: string;
+      latencyMs?: number;
+      approvals?: "all" | string[];
+      deferApprovals?: boolean;
+      autoRecover?: boolean;
+    },
   ) => request<{ id: string }>("POST", `/v1/projects/${enc(p)}/transactions`, body),
   run: (id: string) => request<RunDetail>("GET", `/v1/transactions/${enc(id)}`),
+  resume: (id: string, body: { approvals?: "all" | string[]; deferApprovals?: boolean }) =>
+    request<{ id: string; state: string; awaiting: string[] }>("POST", `/v1/transactions/${enc(id)}/resume`, body),
   recover: (id: string, body: { resolve?: string; operator?: string; note?: string }) =>
     request<{ id: string; state: string }>("POST", `/v1/transactions/${enc(id)}/recover`, body),
 };

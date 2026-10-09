@@ -83,8 +83,94 @@ soil transaction recover <tx-id> --resolve recovered --operator oncall:jane --no
 then runs the declared recovery later. `--deterministic` uses a logical clock so evidence
 hashes are reproducible.
 
-Exit codes for `run` and `recover`: `0` committed · `10` recovered/aborted (no lasting effect)
-· `20` needs attention · `1` usage or validation error.
+### Restartable execution
+
+Every transition is journaled under `.soil/runs/<id>/` before Soil acts on it (`run.json` +
+append-only `journal.jsonl`). A stopped executor continues from exactly where it was:
+
+```sh
+soil init --example ship-fix && soil flow publish flows/ship-fix.yaml
+soil transaction run --flow ship-fix --scenario happy-path --approve all --crash-after 120   # killed (exit 75)
+soil transaction resume <tx-id> --approve all                                               # → COMMITTED
+
+soil transaction run --flow ship-fix --scenario happy-path --defer-approvals   # pauses at the approval (exit 30)
+soil transaction resume <tx-id> --approve approve                              # → COMMITTED
+```
+
+A request that was journaled as `EXECUTING` but whose outcome was not recorded is never sent
+again. On restart it is UNCERTAIN, and observation decides whether it happened. Once sealed, the
+flow version, policies, authority reference and both graphs are pinned by hash. Resume refuses
+anything that changed. See DESIGN.md §10.
+
+Exit codes for `run`, `resume` and `recover`: `0` committed · `10` recovered/aborted (no lasting
+effect) · `20` needs attention · `30` paused for an approval · `1` usage or validation error.
+
+## Policy, constraints and invariants
+
+Authorization stays with AgentScript/Crane. A flow names the contract it is bound to
+(`authority: {provider: crane, contractId, contractHash}`). Soil consumes the result and refuses
+a grant for any other contract version.
+
+Runtime policies bound what a single transaction may do: `maxReplicas`, `maxSpend`,
+`allowedRegions`, `requireVerification`, `requireCompensation`, `permittedAdapters`,
+`maxActionCount` and `maxExecutionDuration`. Each is checked as early as the information
+exists: when the flow is validated, just before an action is dispatched (a violating action is
+never sent), or as a deadline during execution. Invariants read like this:
+
+```yaml
+aliases: {deployment: facts.deploy, checkout: facts.verify}
+invariants:
+  - {id: replica_cap, scope: always, expr: "deployment.replicas <= 50"}
+  - {id: approved_cluster, expr: "deployment.cluster in allowed_clusters"}   # from policy parameters
+  - {id: latency_budget, expr: "checkout.p95_latency < 500ms"}
+```
+
+A violated required invariant prevents commit. UNKNOWN is conservative: it blocks commit unless
+the policy sets `allowUncertainty: true` *and* the invariant opts in with `onUnknown: allow`. See
+[examples/ship-fix/policies/ship-fix-guardrails.yaml](examples/ship-fix/policies/ship-fix-guardrails.yaml)
+and DESIGN.md §11.
+
+## Recovery and compensation
+
+Recovery is declared before execution and acts on observed state. It is never a blind
+rollback. Each action can name a compensation action or a compensation **flow** (a published
+flow pinned by version and run as a nested transaction), a strategy (`compensate`, `retain`,
+`manual`), and a bounded `retry`:
+
+```yaml
+- id: deploy
+  kind: ACTION
+  recovery: {compensation: rollback_deployment, retry: {maxAttempts: 2}}
+- id: restore_traffic
+  kind: COMPENSATE
+  phase: recovery
+  flow: {name: traffic-failback, version: 1, inputs: {canary_weight: "${target.observed.previous_canary}"}}
+```
+
+When an action becomes UNCERTAIN, Soil:
+
+1. holds every downstream action;
+2. observes the resource;
+3. classifies the divergence (`not_applied`, `partially_applied`, `applied_differently`,
+   `unknown`);
+4. selects only the declared compensations for effects actually present;
+5. runs them;
+6. re-observes each original effect to confirm it is gone;
+7. records the outcome.
+
+A retry happens only when observation proves the first attempt did not land.
+
+```sh
+soil init demo --example canary-release && cd demo
+soil flow publish flows/traffic-failback.yaml
+soil flow publish flows/canary-release.yaml
+soil transaction run --flow canary-release --scenario slo-violation
+# deploy → shift traffic → SLO violated → restore traffic → roll back → verify deployment → verify SLO → RECOVERED
+```
+
+Other scenarios: `retry-after-timeout` (COMMITTED after a declared retry),
+`uncertain-partial-shift` (RECOVERED) and `rollback-rejected` (PARTIALLY_RECOVERED).
+See DESIGN.md §12.
 
 ## Control plane and dashboard
 
@@ -122,6 +208,8 @@ API surface (all under `/v1`): `projects`, `projects/{p}/flows[/{f}[/draft|valid
 | `crates/soil-api` | axum control plane with SSE |
 | `dashboard/` | Next.js + React Flow editor and run inspector |
 | `examples/remediation/` | the canonical demo: flow, policy, adapter configs, scenarios |
+| `examples/ship-fix/` | inspect → modify → test → deploy → verify, using every node type |
+| `examples/canary-release/` | recovery and compensation: a compensation flow, declared retry, partial recovery |
 
 The state tables in `soil-core` are tested against the markdown tables in DESIGN.md, so the
 document stays authoritative.
@@ -137,4 +225,5 @@ cd dashboard && npm run build   # type-checks and builds the dashboard
   no live GitHub, Kubernetes, CI or HTTP transport is included yet.
 - AgentScript/Crane integration is a trait (`AuthorityProvider`, `ApprovalProvider`). The CLI
   and API use static development providers.
-- The API store is in-memory, and transaction deadlines (`EXPIRED`) are not enforced yet.
+- The API store is in-memory (the CLI journals to disk), and transaction deadlines (`EXPIRED`)
+  are not enforced yet.

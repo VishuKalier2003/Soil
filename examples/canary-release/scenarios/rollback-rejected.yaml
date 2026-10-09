@@ -1,0 +1,21 @@
+apiVersion: soil.dev/v1alpha1
+kind: SimScenario
+metadata:
+  name: rollback-rejected
+spec:
+  description: "The SLO is violated and the cluster rejects the rollback. Traffic is restored but the new image stays: PARTIALLY_RECOVERED, never a pretend success."
+  expect: PARTIALLY_RECOVERED
+  inputs: {image: "ghcr.io/acme/checkout:3.1.0"}
+  faults: {rollback_deployment: reject}
+  world:
+    deployments:
+      prod/checkout/api: {image: "ghcr.io/acme/checkout:3.0.4", configVersion: cfg-12, replicas: 6}
+    traffic:
+      prod/checkout/api: {canary: 0}
+    http:
+      "https://slo.test/checkout":
+        $byDeploymentImage:
+          deployment: prod/checkout/api
+          cases:
+            "ghcr.io/acme/checkout:3.1.0": {error_rate: 0.084, p99_ms: 1240}
+          default: {error_rate: 0.002, p99_ms: 140}

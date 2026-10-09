@@ -2,10 +2,13 @@
 //! conservatively Soil must execute (uncertainty, irreversibility, verification, approvals).
 
 use crate::canonical::hash_of;
+use crate::constraints::Constraints;
 use crate::flow::Metadata;
 use crate::model::Risk;
 use crate::state::{IllegalTransition, PolicyState, State};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -16,7 +19,7 @@ pub struct PolicyDocument {
     pub spec: PolicySpec,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PolicySpec {
     /// Permit commit with UNKNOWN invariants that declare `onUnknown: allow`.
@@ -34,6 +37,13 @@ pub struct PolicySpec {
     /// Observations (never re-executions) allowed to resolve uncertainty.
     #[serde(default = "default_attempts")]
     pub max_reconcile_attempts: u32,
+    /// Transaction-level constraints.
+    #[serde(default, skip_serializing_if = "Constraints::is_empty")]
+    pub constraints: Constraints,
+    /// Named values usable in expressions as `policy.<name>` and as top-level names, e.g.
+    /// `allowed_clusters` in `deployment.cluster in allowed_clusters`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: BTreeMap<String, Value>,
 }
 
 fn default_attempts() -> u32 {
@@ -48,6 +58,8 @@ impl Default for PolicySpec {
             require_verification_at_or_above: None,
             require_approval_at_or_above: None,
             max_reconcile_attempts: default_attempts(),
+            constraints: Constraints::default(),
+            parameters: BTreeMap::new(),
         }
     }
 }
@@ -96,7 +108,7 @@ pub enum PolicyError {
 }
 
 /// The combination of all pinned policies: the most restrictive value of each field wins.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectivePolicy {
     pub spec: PolicySpec,
@@ -107,6 +119,12 @@ pub struct EffectivePolicy {
 impl EffectivePolicy {
     /// Pins the policies named by a flow (`name` = latest ACTIVE version, `name@n` = exact).
     pub fn resolve(names: &[String], available: &[PolicyVersion]) -> Result<Self, PolicyError> {
+        let pinned = Self::select(names, available)?;
+        Ok(Self::combine(&pinned.iter().collect::<Vec<_>>()))
+    }
+
+    /// The exact policy versions [`EffectivePolicy::resolve`] would pin.
+    pub fn select(names: &[String], available: &[PolicyVersion]) -> Result<Vec<PolicyVersion>, PolicyError> {
         let mut pinned = Vec::new();
         for name in names {
             let (base, version) = match name.split_once('@') {
@@ -130,9 +148,9 @@ impl EffectivePolicy {
             if chosen.state != PolicyState::Active {
                 return Err(PolicyError::NotActive(chosen.reference(), chosen.state));
             }
-            pinned.push(chosen);
+            pinned.push(chosen.clone());
         }
-        Ok(Self::combine(&pinned))
+        Ok(pinned)
     }
 
     pub fn combine(policies: &[&PolicyVersion]) -> Self {
@@ -157,6 +175,11 @@ impl EffectivePolicy {
             );
             spec.max_reconcile_attempts =
                 spec.max_reconcile_attempts.min(p.spec.max_reconcile_attempts);
+            spec.constraints = spec.constraints.combine(&p.spec.constraints);
+            // Parameters: the first policy that defines a name wins.
+            for (k, v) in &p.spec.parameters {
+                spec.parameters.entry(k.clone()).or_insert_with(|| v.clone());
+            }
         }
         let mut refs: Vec<String> = policies.iter().map(|p| p.reference()).collect();
         refs.sort();

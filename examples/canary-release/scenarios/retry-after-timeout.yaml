@@ -1,0 +1,16 @@
+apiVersion: soil.dev/v1alpha1
+kind: SimScenario
+metadata:
+  name: retry-after-timeout
+spec:
+  description: "The first rollout times out before applying. Observation confirms nothing landed, so the declared retry dispatches it again with the same idempotency key; the release commits."
+  expect: COMMITTED
+  inputs: {image: "ghcr.io/acme/checkout:3.1.0"}
+  faults: {deploy: {fault: timeout_before_apply, times: 1}}
+  world:
+    deployments:
+      prod/checkout/api: {image: "ghcr.io/acme/checkout:3.0.4", configVersion: cfg-12, replicas: 6}
+    traffic:
+      prod/checkout/api: {canary: 0}
+    http:
+      "https://slo.test/checkout": {error_rate: 0.002, p99_ms: 140}

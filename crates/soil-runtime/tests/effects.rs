@@ -42,7 +42,7 @@ kind: Flow
 metadata: {{name: effects}}
 spec:
   intent: {{summary: effect semantics, actor: "agent:test", principal: "team:test"}}
-  authority: {{provider: static, reference: grant-test}}
+  authority: {{provider: static, contractId: test/effects, contractHash: "sha256:effects"}}
   adapters: {{k8s: {{type: kubernetes}}, gh: {{type: github}}, ci: {{type: ci}}, http: {{type: http}}}}
   nodes:
 {nodes}

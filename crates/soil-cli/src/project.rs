@@ -191,6 +191,18 @@ impl Project {
         Ok(versions)
     }
 
+    /// Every published version of every flow (compensation flows are resolved from these).
+    pub fn all_flow_versions(&self) -> Result<Vec<FlowVersion>, CliError> {
+        let mut out = Vec::new();
+        let dir = self.root.join(".soil").join("registry").join("flows");
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                out.extend(self.flow_versions(name)?);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn save_flow_version(&self, v: &FlowVersion) -> Result<PathBuf, CliError> {
         let path = self
             .registry("flows", &v.name)
@@ -292,13 +304,12 @@ impl Project {
         Ok(dir)
     }
 
+    /// Loads the durable run state from the journal (verifying it and repairing the log).
     pub fn load_run(&self, id: &str) -> Result<TransactionRun, CliError> {
         let dir = self.find_run_dir(id)?;
-        let run: TransactionRun = read_json(&dir.join("run.json"))?;
-        run.evidence
-            .verify()
-            .map_err(|e| CliError::Corrupt(dir.display().to_string(), e.to_string()))?;
-        Ok(run)
+        soil_runtime::FileJournal::new(&dir)
+            .and_then(|j| j.load())
+            .map_err(|e| CliError::Corrupt(dir.display().to_string(), e.to_string()))
     }
 
     pub fn load_sealed(&self, id: &str) -> Result<SealedTransaction, CliError> {

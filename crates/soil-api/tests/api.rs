@@ -194,6 +194,29 @@ async fn disabled_flows_and_inactive_policies_block_new_runs() {
 }
 
 #[tokio::test]
+async fn paused_runs_resume_after_approval() {
+    let app = app();
+    let (s, v) = post(
+        &app,
+        "/v1/projects/default/transactions",
+        json!({"flow": "prod-remediation", "scenario": "happy-path", "latencyMs": 0, "approvals": [], "deferApprovals": true}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    let id = v["id"].as_str().unwrap().to_string();
+    let paused = wait_done(&app, &id).await;
+    assert_eq!(paused["run"]["state"], "EXECUTING");
+    assert_eq!(paused["awaiting"], json!(["approve_deploy"]));
+    assert_eq!(paused["run"]["nodes"]["deploy"]["dispatched"], 0);
+
+    let (s, v) = post(&app, &format!("/v1/transactions/{id}/resume"), json!({"approvals": ["approve_deploy"]})).await;
+    assert_eq!((s, v["state"].as_str()), (StatusCode::OK, Some("COMMITTED")), "{v}");
+    let (_, detail) = get(&app, &format!("/v1/transactions/{id}")).await;
+    assert_eq!(detail["evidenceVerified"], true);
+    assert!(detail["sealed"]["sealHash"].is_string());
+}
+
+#[tokio::test]
 async fn projects_and_unknown_resources() {
     let app = app();
     let (s, _) = post(&app, "/v1/projects", json!({"name": "payments"})).await;

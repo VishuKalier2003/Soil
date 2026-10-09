@@ -3,7 +3,7 @@
 
 use crate::adapter::{AdapterCatalog, OperationDescriptor};
 use crate::canonical::hash_of;
-use crate::flow::{AuthoritySpec, FlowDocument, FlowGraph, NodeKind, NodeSpec, Phase};
+use crate::flow::{AuthoritySpec, FlowDocument, FlowGraph, NodeKind, NodeSpec, Phase, RecoveryStrategy, SubflowRef};
 use crate::guarantee::{ActionTraits, GuaranteeProfile, GuaranteeRequirement};
 use crate::model::{
     EffectKind, IdempotencyBehavior, Reversibility, Risk, UncertaintySemantics,
@@ -37,9 +37,26 @@ pub struct ResolvedNode {
     pub verified_by: Vec<String>,
     pub compensator: Option<String>,
     pub compensates: Option<String>,
+    /// Effective recovery strategy (declared, or `compensate` when a compensation exists).
+    pub strategy: Option<RecoveryStrategy>,
+    /// Additional dispatches allowed after an UNCERTAIN outcome confirmed absent.
+    #[serde(default)]
+    pub retry_attempts: u32,
+    /// Compensation flow pinned at plan time (COMPENSATE nodes with `flow`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subflow: Option<Box<PinnedSubflow>>,
     pub actor: String,
     pub principal: String,
     pub timeout_ms: u64,
+}
+
+/// A compensation flow resolved and pinned when the parent transaction is planned: the exact
+/// published version (verified against its hash) and the exact policy versions it uses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinnedSubflow {
+    pub version: FlowVersion,
+    pub policies: Vec<PolicyVersion>,
 }
 
 impl ResolvedNode {
@@ -116,13 +133,63 @@ pub enum PlanError {
     },
     #[error("intent summary: {0}")]
     Template(#[from] TemplateError),
+    #[error("constraints violated:\n{0}")]
+    Constraints(ValidationReport),
+    #[error("compensation flow {0} is not published")]
+    MissingFlow(String),
+    #[error("compensation flow {0} is invalid:\n{1}")]
+    InvalidSubflow(String, ValidationReport),
 }
 
+/// Plans a flow that does not use compensation flows (see [`plan_with`]).
 pub fn plan(
     version: &FlowVersion,
     inputs: BTreeMap<String, Value>,
     catalog: &AdapterCatalog,
     policies: &[PolicyVersion],
+) -> Result<TransactionPlan, PlanError> {
+    plan_with(version, inputs, catalog, policies, &[])
+}
+
+/// Resolves and pins one compensation flow.
+fn pin_subflow(
+    r: &SubflowRef,
+    flows: &[FlowVersion],
+    catalog: &AdapterCatalog,
+    policies: &[PolicyVersion],
+) -> Result<PinnedSubflow, PlanError> {
+    let version = flows
+        .iter()
+        .find(|f| f.name == r.name && f.version == r.version)
+        .ok_or_else(|| PlanError::MissingFlow(r.to_string()))?;
+    if !version.verify() {
+        return Err(PlanError::Tampered(version.reference().to_string()));
+    }
+    let spec = &version.document.spec;
+    let pinned = EffectivePolicy::select(&spec.policies, policies)?;
+    let effective = EffectivePolicy::combine(&pinned.iter().collect::<Vec<_>>());
+    let report = validate_flow(&version.document, catalog, &effective);
+    if !report.is_ok() {
+        return Err(PlanError::InvalidSubflow(r.to_string(), report));
+    }
+    if spec.nodes.iter().any(|n| n.flow.is_some()) {
+        let mut nested = ValidationReport::default();
+        nested.error("subflow", "spec.nodes", "compensation flows cannot themselves use compensation flows");
+        return Err(PlanError::InvalidSubflow(r.to_string(), nested));
+    }
+    Ok(PinnedSubflow {
+        version: version.clone(),
+        policies: pinned,
+    })
+}
+
+/// Plans a flow, resolving and pinning its compensation flows from `flows`.
+pub fn plan_with(
+    version: &FlowVersion,
+    inputs: BTreeMap<String, Value>,
+    catalog: &AdapterCatalog,
+    policies: &[PolicyVersion],
+    flows: &[FlowVersion],
 ) -> Result<TransactionPlan, PlanError> {
     if !version.verify() {
         return Err(PlanError::Tampered(version.reference().to_string()));
@@ -151,6 +218,34 @@ pub fn plan(
     let summary = template::render_str(&spec.intent.summary, &json!({ "inputs": resolved_inputs }))?;
 
     let graph = FlowGraph::new(spec);
+
+    // Dimension constraints whose values are already known (literals and inputs). Values that
+    // depend on facts are checked at dispatch.
+    let mut violations = ValidationReport::default();
+    let input_ctx = json!({ "inputs": resolved_inputs });
+    for n in &spec.nodes {
+        let Some((_, op)) = resolve_operation(spec, n, catalog).ok().flatten() else { continue };
+        if !n.kind.is_effectful() {
+            continue;
+        }
+        let Ok(params) = template::render(&n.params, &input_ctx) else { continue };
+        let config = n
+            .adapter
+            .as_ref()
+            .and_then(|a| spec.adapters.get(a))
+            .map(|b| b.config.clone())
+            .unwrap_or(Value::Null);
+        let dims = crate::constraints::dimensions(op, &params, &config);
+        for check in crate::constraints::check_action(&policy.spec.constraints, &dims) {
+            if check.result == crate::expr::Truth::False {
+                violations.error("constraint", format!("node '{}'", n.id), format!("{}: {}", check.constraint, check.detail));
+            }
+        }
+    }
+    if !violations.is_ok() {
+        return Err(PlanError::Constraints(violations));
+    }
+
     let mut nodes = BTreeMap::new();
     let mut adapters = BTreeMap::new();
     for n in &spec.nodes {
@@ -160,6 +255,13 @@ pub fn plan(
             adapters.insert(d.adapter_type.clone(), d.version);
         }
         let binding = n.adapter.as_ref().and_then(|a| spec.adapters.get(a));
+        let compensator = graph.compensator_of(&n.id).map(String::from);
+        let declared = n.recovery.as_ref().and_then(|r| r.strategy);
+        let strategy = declared.or_else(|| compensator.as_ref().map(|_| RecoveryStrategy::Compensate));
+        let subflow = match &n.flow {
+            Some(r) => Some(Box::new(pin_subflow(r, flows, catalog, policies)?)),
+            None => None,
+        };
         nodes.insert(
             n.id.clone(),
             ResolvedNode {
@@ -174,8 +276,11 @@ pub fn plan(
                 verification: traits.verification,
                 uncertainty: traits.uncertainty,
                 verified_by: graph.verifiers_of(&n.id).into_iter().map(String::from).collect(),
-                compensator: graph.compensator_of(&n.id).map(String::from),
+                compensator,
                 compensates: graph.compensation_target(&n.id).map(String::from),
+                strategy,
+                retry_attempts: n.recovery.as_ref().and_then(|r| r.retry).map(|r| r.max_attempts).unwrap_or(0),
+                subflow,
                 actor: n.actor.clone().unwrap_or_else(|| spec.intent.actor.clone()),
                 principal: n
                     .principal
@@ -197,6 +302,7 @@ pub fn plan(
             verified_by_node: !n.verified_by.is_empty(),
             uncertainty: n.uncertainty,
             idempotency: n.idempotency,
+            not_undone: matches!(n.strategy, Some(RecoveryStrategy::Retain | RecoveryStrategy::Manual)),
         })
         .collect();
     let guarantees = GuaranteeProfile::derive(&actions);

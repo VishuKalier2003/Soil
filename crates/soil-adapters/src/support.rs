@@ -3,7 +3,7 @@
 use crate::transport::{ProviderRequest, ProviderResponse, Transport};
 use serde_json::Value;
 use soil_core::adapter::{
-    AdapterResult, CompensationCapability, Invocation, OperationDescriptor, Schema,
+    AdapterResult, CompensationCapability, Dimension, Invocation, OperationDescriptor, Schema,
     UncertaintyCause,
 };
 use soil_core::model::{
@@ -34,6 +34,7 @@ impl Op {
             verification: VerificationStrategy::None,
             uncertainty: UncertaintySemantics::Reconcilable,
             compensation: CompensationCapability::None,
+            dimensions: Default::default(),
         })
     }
 
@@ -103,6 +104,18 @@ impl Op {
         };
         self
     }
+    /// Declares a constrained dimension read from the invocation (`params.*` / `config.*`).
+    pub fn dimension(mut self, name: &str, expr: &str, optional: bool) -> Self {
+        self.0.dimensions.insert(
+            name.into(),
+            Dimension {
+                expr: expr.into(),
+                optional,
+            },
+        );
+        self
+    }
+
     pub fn build(self) -> OperationDescriptor {
         self.0
     }

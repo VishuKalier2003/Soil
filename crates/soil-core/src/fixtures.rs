@@ -45,6 +45,7 @@ fn op(
             },
             None => CompensationCapability::None,
         },
+        dimensions: Default::default(),
     }
 }
 
@@ -86,7 +87,7 @@ spec:
     actor: agent:test
     principal: team:test
     inputs: {name: {required: true}, color: {default: blue}}
-  authority: {provider: static, reference: grant-1}
+  authority: {provider: static, contractId: test/demo, contractHash: "sha256:demo-contract"}
   adapters: {fake: {type: fake}}
   guarantees: {require: [compensatable, verified]}
   nodes:

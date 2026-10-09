@@ -168,6 +168,17 @@ impl CompensationCapability {
     }
 }
 
+/// A constrained dimension of an operation (e.g. `replicas`, `region`), read from the rendered
+/// invocation: an expression path over `params` and the binding `config`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Dimension {
+    pub expr: String,
+    /// When unset, the dimension does not apply (instead of being UNKNOWN).
+    #[serde(default)]
+    pub optional: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationDescriptor {
@@ -200,6 +211,9 @@ pub struct OperationDescriptor {
     pub verification: VerificationStrategy,
     pub uncertainty: UncertaintySemantics,
     pub compensation: CompensationCapability,
+    /// Dimensions that transaction constraints apply to (`replicas`, `region`, …).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dimensions: BTreeMap<String, Dimension>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,6 +268,8 @@ pub enum UncertaintyCause {
     Inconclusive,
     /// The adapter broke the result contract (wrong result kind or malformed output).
     ProtocolViolation,
+    /// The executor stopped while the request was in flight (detected on restart).
+    Interrupted,
 }
 
 /// The normalized result of any adapter call.
@@ -471,6 +487,7 @@ mod tests {
             verification: VerificationStrategy::ReadBack,
             uncertainty: UncertaintySemantics::Reconcilable,
             compensation: CompensationCapability::None,
+            dimensions: BTreeMap::new(),
         };
         let bad = AdapterResult::Success { state: json!({"image": 7}) };
         assert!(matches!(bad.into_execution(Some(&op)), AdapterResult::Uncertain { .. }));

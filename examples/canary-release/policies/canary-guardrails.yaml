@@ -1,0 +1,16 @@
+apiVersion: soil.dev/v1alpha1
+kind: Policy
+metadata:
+  name: canary-guardrails
+  description: Bounds what one canary release transaction may do.
+spec:
+  allowUncertainty: false          # UNKNOWN required invariants block commit
+  maxReconcileAttempts: 3
+  constraints:
+    maxReplicas: 50
+    allowedRegions: [eu-west-1]
+    requireVerification: true
+    requireCompensation: true
+    permittedAdapters: [kubernetes, http]
+    maxActionCount: 4
+    maxExecutionDuration: 15m

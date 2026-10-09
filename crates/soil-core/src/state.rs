@@ -111,7 +111,7 @@ machine! {
         Sealed("SEALED") => [Ready, Blocked, Cancelled, Expired],
         Ready("READY") => [Executing, Blocked, Cancelled, Expired],
         Executing("EXECUTING") => [Observing, Failed, Uncertain],
-        Observing("OBSERVING") => [Verified, Failed, Uncertain],
+        Observing("OBSERVING") => [Verified, Failed, Uncertain, Ready],
         Verified("VERIFIED") => [Succeeded],
         Succeeded("SUCCEEDED") => [CompensationPending],
         Failed("FAILED") => [CompensationPending],

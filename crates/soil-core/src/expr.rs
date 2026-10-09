@@ -6,13 +6,18 @@
 //! or      := and ( "||" and )*
 //! and     := unary ( "&&" unary )*
 //! unary   := "!" unary | compare
-//! compare := primary ( ("=="|"!="|"<"|"<="|">"|">=") primary )?
-//! primary := literal | path | "exists" "(" path ")" | "(" expr ")"
+//! compare := primary ( ("=="|"!="|"<"|"<="|">"|">="|"in") primary )?
+//! primary := literal | path | list | "exists" "(" path ")" | "(" expr ")"
+//! list    := "[" ( expr ( "," expr )* )? "]"
 //! path    := ident ( "." ident | "[" (string|integer) "]" )*
+//! literal := string | number | duration | true | false | null
+//! duration:= number ("ms" | "s" | "m" | "h")      -- evaluates to milliseconds
 //! ```
 //!
 //! Evaluation is three-valued (Kleene logic). A missing path is UNKNOWN, never FALSE, so that
-//! "we could not see it" is never confused with "it is not so".
+//! "we could not see it" is never confused with "it is not so". Ordering comparisons treat
+//! duration strings such as `"420ms"` or `"1.5s"` as milliseconds, so
+//! `checkout.p95_latency < 500ms` works whether the observed value is `420` or `"420ms"`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -132,6 +137,34 @@ pub enum CmpOp {
     Le,
     Gt,
     Ge,
+    /// Membership in a list.
+    In,
+}
+
+/// Parses `500ms`, `2s`, `1.5m`, `1h` (as written in expressions or observed as strings) into
+/// milliseconds.
+pub fn parse_duration_ms(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let split = s.find(|c: char| c.is_ascii_alphabetic())?;
+    let (num, unit) = s.split_at(split);
+    let n: f64 = num.trim().parse().ok()?;
+    let factor = match unit {
+        "ms" => 1.0,
+        "s" => 1_000.0,
+        "m" => 60_000.0,
+        "h" => 3_600_000.0,
+        _ => return None,
+    };
+    Some(n * factor)
+}
+
+/// Numeric view of a value: numbers, and duration strings in milliseconds.
+fn as_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => parse_duration_ms(s),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,6 +176,7 @@ pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Compare(CmpOp, Box<Expr>, Box<Expr>),
+    List(Vec<Expr>),
 }
 
 impl Expr {
@@ -150,7 +184,7 @@ impl Expr {
     pub fn eval(&self, ctx: &Value) -> Truth {
         match self {
             Expr::Literal(Value::Bool(b)) => Truth::from_bool(*b),
-            Expr::Literal(_) => Truth::Unknown,
+            Expr::Literal(_) | Expr::List(_) => Truth::Unknown,
             Expr::Path(p) => match p.lookup(ctx) {
                 Some(Value::Bool(b)) => Truth::from_bool(*b),
                 _ => Truth::Unknown,
@@ -168,6 +202,12 @@ impl Expr {
         match self {
             Expr::Literal(v) => Some(v.clone()),
             Expr::Path(p) => p.lookup(ctx).cloned(),
+            // A list is known only if all of its items are.
+            Expr::List(items) => items
+                .iter()
+                .map(|e| e.value(ctx))
+                .collect::<Option<Vec<_>>>()
+                .map(Value::Array),
             other => match other.eval(ctx) {
                 Truth::True => Some(Value::Bool(true)),
                 Truth::False => Some(Value::Bool(false)),
@@ -188,6 +228,7 @@ impl Expr {
             Expr::Literal(_) => {}
             Expr::Path(p) | Expr::Exists(p) => out.push(p),
             Expr::Not(e) => e.collect_paths(out),
+            Expr::List(items) => items.iter().for_each(|e| e.collect_paths(out)),
             Expr::And(a, b) | Expr::Or(a, b) | Expr::Compare(_, a, b) => {
                 a.collect_paths(out);
                 b.collect_paths(out);
@@ -203,15 +244,17 @@ fn compare(op: CmpOp, a: Option<Value>, b: Option<Value>) -> Truth {
     match op {
         CmpOp::Eq => Truth::from_bool(values_equal(&a, &b)),
         CmpOp::Ne => Truth::from_bool(!values_equal(&a, &b)),
+        CmpOp::In => match &b {
+            Value::Array(items) => Truth::from_bool(items.iter().any(|i| values_equal(&a, i))),
+            _ => Truth::Unknown,
+        },
         _ => {
-            let ord = match (&a, &b) {
-                (Value::Number(x), Value::Number(y)) => {
-                    match x.as_f64().zip(y.as_f64()).and_then(|(x, y)| x.partial_cmp(&y)) {
-                        Some(o) => o,
-                        None => return Truth::Unknown,
-                    }
-                }
-                (Value::String(x), Value::String(y)) => x.cmp(y),
+            let ord = match (as_number(&a), as_number(&b), &a, &b) {
+                (Some(x), Some(y), _, _) => match x.partial_cmp(&y) {
+                    Some(o) => o,
+                    None => return Truth::Unknown,
+                },
+                (_, _, Value::String(x), Value::String(y)) => x.cmp(y),
                 _ => return Truth::Unknown,
             };
             Truth::from_bool(match op {
@@ -219,16 +262,19 @@ fn compare(op: CmpOp, a: Option<Value>, b: Option<Value>) -> Truth {
                 CmpOp::Le => ord != Ordering::Greater,
                 CmpOp::Gt => ord == Ordering::Greater,
                 CmpOp::Ge => ord != Ordering::Less,
-                CmpOp::Eq | CmpOp::Ne => unreachable!(),
+                CmpOp::Eq | CmpOp::Ne | CmpOp::In => unreachable!(),
             })
         }
     }
 }
 
-/// Structural equality where numbers compare numerically (`100 == 100.0`).
+/// Structural equality where numbers compare numerically (`100 == 100.0`, `500 == "500ms"`).
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+        (Value::Number(_), Value::String(_)) | (Value::String(_), Value::Number(_)) => {
+            matches!((as_number(a), as_number(b)), (Some(x), Some(y)) if x == y)
+        }
         (Value::Array(x), Value::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(a, b)| values_equal(a, b))
         }
@@ -253,6 +299,7 @@ enum Tok {
     RParen,
     LBracket,
     RBracket,
+    Comma,
     Dot,
     Bang,
     AndAnd,
@@ -273,7 +320,7 @@ fn lex(src: &str) -> Result<Vec<(usize, Tok)>, ExprError> {
         let next = chars.get(i + 1).map(|x| x.1);
         match c {
             c if c.is_whitespace() => i += 1,
-            '(' | ')' | '[' | ']' | '.' => {
+            '(' | ')' | '[' | ']' | '.' | ',' => {
                 out.push((
                     pos,
                     match c {
@@ -281,6 +328,7 @@ fn lex(src: &str) -> Result<Vec<(usize, Tok)>, ExprError> {
                         ')' => Tok::RParen,
                         '[' => Tok::LBracket,
                         ']' => Tok::RBracket,
+                        ',' => Tok::Comma,
                         _ => Tok::Dot,
                     },
                 ));
@@ -364,7 +412,19 @@ fn lex(src: &str) -> Result<Vec<(usize, Tok)>, ExprError> {
                 }
                 let text: String = chars[start..i].iter().map(|x| x.1).collect();
                 let n: f64 = text.parse().map_err(|_| err(pos, "invalid number"))?;
-                out.push((pos, Tok::Num(n, is_int)));
+                // A unit directly after the digits makes a duration in milliseconds.
+                let unit_start = i;
+                while chars.get(i).is_some_and(|x| x.1.is_ascii_alphabetic()) {
+                    i += 1;
+                }
+                if i > unit_start {
+                    let unit: String = chars[unit_start..i].iter().map(|x| x.1).collect();
+                    let ms = parse_duration_ms(&format!("{text}{unit}"))
+                        .ok_or_else(|| err(pos, &format!("unknown duration unit '{unit}' (use ms, s, m, h)")))?;
+                    out.push((pos, Tok::Num(ms, ms.fract() == 0.0)));
+                } else {
+                    out.push((pos, Tok::Num(n, is_int)));
+                }
             }
             c if c.is_ascii_alphabetic() || c == '_' => {
                 let start = i;
@@ -450,12 +510,14 @@ impl Parser {
 
     fn compare(&mut self) -> Result<Expr, ExprError> {
         let left = self.primary()?;
-        if let Some(Tok::Cmp(op)) = self.peek().cloned() {
-            self.pos += 1;
-            let right = self.primary()?;
-            return Ok(Expr::Compare(op, Box::new(left), Box::new(right)));
-        }
-        Ok(left)
+        let op = match self.peek().cloned() {
+            Some(Tok::Cmp(op)) => op,
+            Some(Tok::Ident(w)) if w == "in" => CmpOp::In,
+            _ => return Ok(left),
+        };
+        self.pos += 1;
+        let right = self.primary()?;
+        Ok(Expr::Compare(op, Box::new(left), Box::new(right)))
     }
 
     fn primary(&mut self) -> Result<Expr, ExprError> {
@@ -466,6 +528,24 @@ impl Parser {
                 Ok(e)
             }
             Some(Tok::Str(s)) => Ok(Expr::Literal(Value::String(s))),
+            Some(Tok::LBracket) => {
+                let mut items = Vec::new();
+                if self.peek() == Some(&Tok::RBracket) {
+                    self.pos += 1;
+                    return Ok(Expr::List(items));
+                }
+                loop {
+                    items.push(self.or()?);
+                    match self.bump() {
+                        Some(Tok::Comma) => continue,
+                        Some(Tok::RBracket) => return Ok(Expr::List(items)),
+                        _ => {
+                            self.pos -= 1;
+                            return self.err("expected ',' or ']' in list");
+                        }
+                    }
+                }
+            }
             Some(Tok::Num(n, is_int)) => Ok(Expr::Literal(number(n, is_int))),
             Some(Tok::Ident(id)) => match id.as_str() {
                 "true" => Ok(Expr::Literal(Value::Bool(true))),
@@ -644,9 +724,37 @@ mod tests {
 
     #[test]
     fn parse_errors() {
-        for bad in ["", "a ==", "(a", "a.", "a[", "'x", "a ~ b", "a b", "exists(1)"] {
+        for bad in ["", "a ==", "(a", "a.", "a[", "'x", "a ~ b", "a b", "exists(1)", "a in [1, 2", "[1 2]"] {
             assert!(parse(bad).is_err(), "{bad} should not parse");
         }
+    }
+
+    #[test]
+    fn membership_and_lists() {
+        let ctx = json!({"deployment": {"cluster": "prod-eu"}, "allowed_clusters": ["prod-eu", "prod-us"]});
+        let t = |src: &str| parse(src).unwrap_or_else(|e| panic!("{src}: {e}")).eval(&ctx);
+        assert_eq!(t("deployment.cluster in allowed_clusters"), Truth::True);
+        assert_eq!(t("deployment.cluster in ['staging']"), Truth::False);
+        assert_eq!(t("!(deployment.cluster in ['staging', 'dev'])"), Truth::True);
+        assert_eq!(t("deployment.region in allowed_clusters"), Truth::Unknown);
+        assert_eq!(t("deployment.cluster in nothing"), Truth::Unknown);
+        assert_eq!(t("3 in [1, 2, 3.0]"), Truth::True);
+        assert_eq!(t("deployment.cluster in []"), Truth::False);
+    }
+
+    #[test]
+    fn durations() {
+        let ctx = json!({"checkout": {"p95_latency": 420, "p99": "1.2s", "text": "slow"}});
+        let t = |src: &str| parse(src).unwrap_or_else(|e| panic!("{src}: {e}")).eval(&ctx);
+        assert_eq!(t("checkout.p95_latency < 500ms"), Truth::True);
+        assert_eq!(t("checkout.p95_latency < 0.4s"), Truth::False);
+        assert_eq!(t("checkout.p99 > 1s"), Truth::True);
+        assert_eq!(t("checkout.p99 <= 1200ms"), Truth::True);
+        assert_eq!(t("checkout.p99 == 1200"), Truth::True);
+        assert_eq!(t("2m == 120s"), Truth::True);
+        assert_eq!(t("checkout.text < 1s"), Truth::Unknown);
+        assert!(parse("1parsec > 2").is_err());
+        assert_eq!(parse_duration_ms("1.5h"), Some(5_400_000.0));
     }
 
     #[test]

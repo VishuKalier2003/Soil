@@ -61,6 +61,15 @@ export interface NodeSpec {
   idempotency?: { behavior: Idempotency; key?: string };
   risk?: Risk;
   timeoutMs?: number;
+  cost?: { amount: number; currency: string };
+  /** Declared before execution: strategy, compensation and bounded retry. */
+  recovery?: {
+    strategy?: "compensate" | "retain" | "manual";
+    compensation?: string;
+    retry?: { maxAttempts: number };
+  };
+  /** COMPENSATE nodes only: run a published flow as a nested transaction. */
+  flow?: { name: string; version: number; inputs?: Record<string, unknown> };
   ui?: { x: number; y: number };
 }
 
@@ -75,6 +84,7 @@ export interface InvariantSpec {
   description?: string;
   expr: string;
   scope?: string;
+  severity?: "required" | "advisory";
   onUnknown?: "block" | "allow";
 }
 
@@ -96,7 +106,8 @@ export interface FlowDocument {
       principal: string;
       inputs?: Record<string, { description?: string; required?: boolean; default?: unknown }>;
     };
-    authority: { provider: string; reference: string };
+    authority: { provider: string; contractId: string; contractHash: string };
+    aliases?: Record<string, string>;
     policies?: string[];
     guarantees?: { require: string[] };
     adapters?: Record<string, AdapterBinding>;
@@ -163,9 +174,12 @@ export type AdapterResult =
   | { kind: "OBSERVED_STATE"; presence: Presence; state: unknown };
 
 /** EXPECTED vs OBSERVED. */
+export type Divergence = "none" | "not_applied" | "partially_applied" | "applied_differently" | "unknown";
+
 export interface EffectComparison {
   outcome: "MATCHED" | "DIVERGED" | "UNKNOWN";
   presence: Presence;
+  divergence: Divergence;
   postconditions: { expr: string; result: "true" | "false" | "unknown" }[];
   observed: unknown;
   reason: string;
@@ -239,9 +253,12 @@ export interface NodeRun {
   discovered?: unknown;
   outcome?: string | null;
   comparison?: EffectComparison | null;
+  constraints?: { constraint: string; result: "true" | "false" | "unknown"; detail: string }[];
   verification?: string | null;
   reason?: string | null;
   failureClass?: string | null;
+  /** Nested transaction of a compensation flow. */
+  subrun?: TransactionRun | null;
 }
 
 export interface EvidenceRecord {
@@ -283,6 +300,11 @@ export interface RecoveryRun {
   plan: string[];
   uncovered: string[];
   residual: string[];
+  divergence?: Record<string, Divergence>;
+  retained?: string[];
+  manual?: string[];
+  /** Compensated effects whose absence was confirmed by observation. */
+  restored?: string[];
 }
 
 export interface TransactionRun {
@@ -299,10 +321,24 @@ export interface TransactionRun {
   recovery: RecoveryRun;
   failure?: { node?: string | null; class: string; reason: string } | null;
   facts: Record<string, unknown>;
-  authority?: { provider: string; reference: string; decisionRef: string; approvalRef?: string } | null;
+  authority?: { provider: string; contractId: string; contractHash: string; decisionRef: string; approvalRef?: string } | null;
+  /** Immutable hashes pinned at SEALED. */
+  pins?: SealPins | null;
+  /** Non-empty when the run is paused waiting for approvals. */
+  awaiting?: string[];
   startedAtMs: number;
   finishedAtMs?: number | null;
   evidence: { transactionId: string; records: EvidenceRecord[] };
+}
+
+export interface SealPins {
+  flow: { name: string; version: number; hash: string };
+  policyRefs: string[];
+  policyHash: string;
+  authorityHash: string;
+  actionGraphHash: string;
+  recoveryGraphHash: string;
+  planHash: string;
 }
 
 export interface RunSummary {
@@ -318,6 +354,7 @@ export interface RunSummary {
   recovery?: string | null;
   guarantee?: string | null;
   finishedAtMs?: number | null;
+  awaiting?: string[] | null;
 }
 
 export interface RunDetail extends RunSummary {
@@ -334,7 +371,7 @@ export interface RunDetail extends RunSummary {
     policy: { refs: string[] };
     intent: { summary: string; inputs: Record<string, unknown> };
   };
-  sealed?: { sealHash: string; authority: { provider: string; reference: string; decisionRef: string } } | null;
+  sealed?: { sealHash: string; authority: { provider: string; contractId: string; contractHash: string; decisionRef: string } } | null;
   run?: TransactionRun | null;
   evidenceVerified?: boolean | null;
 }

@@ -64,6 +64,8 @@ pub struct ActionTraits {
     pub verified_by_node: bool,
     pub uncertainty: UncertaintySemantics,
     pub idempotency: IdempotencyBehavior,
+    /// Recovery strategy declares the effect is kept (`retain`) or left to a human (`manual`).
+    pub not_undone: bool,
 }
 
 fn coverage(total: usize, ok: usize) -> Coverage {
@@ -88,14 +90,20 @@ impl GuaranteeProfile {
             .collect();
         let uncovered: Vec<&str> = actions
             .iter()
-            .filter(|a| a.reversibility.needs_compensation() && !a.has_compensator)
+            .filter(|a| a.reversibility.needs_compensation() && !a.has_compensator && !a.not_undone)
             .map(|a| a.id.as_str())
             .collect();
+        let kept: Vec<&str> = actions.iter().filter(|a| a.not_undone).map(|a| a.id.as_str()).collect();
+        if !kept.is_empty() {
+            notes.push(format!("declared not to be undone (retain/manual): {}", kept.join(", ")));
+        }
         let atomicity = if !uncovered.is_empty() {
             notes.push(format!("no declared compensation for: {}", uncovered.join(", ")));
             Atomicity::None
-        } else if !irreversible.is_empty() {
-            notes.push(format!("irreversible actions: {}", irreversible.join(", ")));
+        } else if !irreversible.is_empty() || !kept.is_empty() {
+            if !irreversible.is_empty() {
+                notes.push(format!("irreversible actions: {}", irreversible.join(", ")));
+            }
             Atomicity::BestEffort
         } else {
             Atomicity::Compensatable
@@ -160,6 +168,7 @@ mod tests {
             verified_by_node: false,
             uncertainty: UncertaintySemantics::Reconcilable,
             idempotency: IdempotencyBehavior::Natural,
+            not_undone: false,
         }
     }
 

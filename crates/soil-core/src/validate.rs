@@ -164,6 +164,9 @@ pub fn node_traits(node: &NodeSpec, op: Option<&OperationDescriptor>) -> NodeTra
     }
 }
 
+/// Expression roots with built-in meaning; aliases and policy parameters may not shadow them.
+pub const RESERVED_ROOTS: [&str; 8] = ["inputs", "facts", "tx", "policy", "params", "observed", "target", "config"];
+
 /// Which expression roots a given expression may read.
 struct Scope<'a> {
     observed: bool,
@@ -177,6 +180,8 @@ struct Scope<'a> {
 struct Checker<'a> {
     graph: FlowGraph<'a>,
     inputs: BTreeSet<&'a str>,
+    /// Flow aliases and policy parameters, readable as top-level names.
+    names: BTreeSet<String>,
     report: ValidationReport,
 }
 
@@ -220,7 +225,8 @@ impl<'a> Checker<'a> {
             "observed" if scope.observed => {}
             "params" if scope.params => {}
             "target" if scope.target => {}
-            "tx" => {}
+            "tx" | "policy" => {}
+            name if self.names.contains(name) => {}
             other => self.report.error(
                 "expr-root",
                 path,
@@ -261,6 +267,12 @@ pub fn validate_flow(
     let mut c = Checker {
         graph: FlowGraph::new(spec),
         inputs: spec.intent.inputs.keys().map(String::as_str).collect(),
+        names: spec
+            .aliases
+            .keys()
+            .chain(policy.spec.parameters.keys())
+            .cloned()
+            .collect(),
         report: ValidationReport::default(),
     };
 
@@ -288,7 +300,8 @@ pub fn validate_flow(
         ("spec.intent.actor", &spec.intent.actor),
         ("spec.intent.principal", &spec.intent.principal),
         ("spec.authority.provider", &spec.authority.provider),
-        ("spec.authority.reference", &spec.authority.reference),
+        ("spec.authority.contractId", &spec.authority.contract_id),
+        ("spec.authority.contractHash", &spec.authority.contract_hash),
     ] {
         if value.trim().is_empty() {
             c.report.error("required", field, "must not be empty");
@@ -315,6 +328,37 @@ pub fn validate_flow(
         &serde_json::Value::String(spec.intent.summary.clone()),
         &intent_scope,
     );
+    // Aliases: valid names that point at readable paths.
+    let alias_scope = Scope {
+        observed: false,
+        params: false,
+        target: false,
+        ancestors: None,
+        self_id: None,
+    };
+    for (name, target) in &spec.aliases {
+        let path = format!("spec.aliases.{name}");
+        if !valid_id(name) || RESERVED_ROOTS.contains(&name.as_str()) {
+            c.report.error("alias", &path, "alias names must match [a-z_][a-z0-9_]* and not shadow a reserved name");
+        }
+        if policy.spec.parameters.contains_key(name) {
+            c.report.error("alias", &path, format!("'{name}' is also a policy parameter"));
+        }
+        match expr::parse_path(target) {
+            Err(e) => c.report.error("alias", &path, format!("'{target}' is not a path: {}", e.message)),
+            Ok(p) if p.first().is_some_and(|r| spec.aliases.contains_key(r) && !RESERVED_ROOTS.contains(&r)) => {
+                c.report.error("alias", &path, "aliases cannot refer to other aliases")
+            }
+            Ok(p) => c.check_path(&path, &p, &alias_scope),
+        }
+    }
+    for (i, n) in spec.nodes.iter().enumerate() {
+        if let Some(cost) = &n.cost {
+            if cost.amount < 0.0 || cost.currency.trim().is_empty() {
+                c.report.error("cost", format!("spec.nodes[{i}].cost"), "cost needs a non-negative amount and a currency");
+            }
+        }
+    }
     if spec.execution.max_parallelism == 0 {
         c.report
             .error("parallelism", "spec.execution.maxParallelism", "must be at least 1");
@@ -412,10 +456,22 @@ pub fn validate_flow(
                 }
             }
             None => {
-                if n.kind.requires_adapter() && n.adapter.is_none() {
+                let flow_compensation = n.kind == NodeKind::Compensate && n.flow.is_some();
+                if n.kind.requires_adapter() && n.adapter.is_none() && !flow_compensation {
                     c.report
-                        .error("adapter", &path, format!("{:?} nodes require adapter and operation", n.kind));
+                        .error("adapter", &path, format!("{:?} nodes require adapter and operation (or, for COMPENSATE, a flow)", n.kind));
                 }
+            }
+        }
+        if let Some(sub) = &n.flow {
+            if n.kind != NodeKind::Compensate {
+                c.report.error("subflow", &path, "only COMPENSATE nodes may run a flow");
+            }
+            if n.adapter.is_some() || n.operation.is_some() {
+                c.report.error("subflow", &path, "a node runs either an adapter operation or a flow, not both");
+            }
+            if !valid_name(&sub.name) || sub.version == 0 {
+                c.report.error("subflow", &path, "flow must name a published flow and a version ≥ 1");
             }
         }
         match n.kind {
@@ -464,6 +520,9 @@ pub fn validate_flow(
             c.check_expr(&format!("{path}.expr"), e, &pre);
         }
         c.check_template(&format!("{path}.params"), &n.params, &tmpl);
+        if let Some(sub) = &n.flow {
+            c.check_template(&format!("{path}.flow.inputs"), &sub.inputs, &tmpl);
+        }
         if let Some(r) = &n.resource {
             c.check_template(&format!("{path}.resource"), &serde_json::Value::String(r.clone()), &tmpl);
         }
@@ -551,17 +610,19 @@ pub fn validate_flow(
         let path = format!("node '{}'", n.id);
         let op = resolve_operation(spec, n, catalog).ok().flatten().map(|x| x.1);
         let traits = node_traits(n, op);
-        let compensators = spec
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Compensates && e.to == n.id)
-            .count();
+        let compensators = c.graph.compensators_of(&n.id).len();
+        if let Some(rc) = n.recovery.as_ref().and_then(|r| r.compensation.as_deref()) {
+            match c.graph.node(rc) {
+                Some(t) if t.kind == NodeKind::Compensate => {}
+                _ => c.report.error(
+                    "compensation",
+                    &path,
+                    format!("recovery.compensation '{rc}' is not a COMPENSATE node"),
+                ),
+            }
+        }
         if n.kind == NodeKind::Compensate {
-            let targets = spec
-                .edges
-                .iter()
-                .filter(|e| e.kind == EdgeKind::Compensates && e.from == n.id)
-                .count();
+            let targets = c.graph.compensation_targets(&n.id).len();
             if targets != 1 {
                 c.report.error(
                     "compensate-target",
@@ -590,10 +651,37 @@ pub fn validate_flow(
                 }
             }
         }
+        if let Some(retry) = n.recovery.as_ref().and_then(|r| r.retry) {
+            let path = format!("{path}.recovery.retry");
+            if !n.kind.is_effectful() {
+                c.report.error("retry", &path, "only ACTION and COMPENSATE nodes can declare a retry");
+            }
+            if !(1..=5).contains(&retry.max_attempts) {
+                c.report.error("retry", &path, "maxAttempts must be between 1 and 5");
+            }
+            if traits.idempotency == IdempotencyBehavior::None {
+                c.report.error("retry", &path, "retrying a non-idempotent operation could duplicate its effect");
+            }
+            if traits.uncertainty == UncertaintySemantics::Unreconcilable {
+                c.report.error("retry", &path, "a retry needs an observable operation to confirm the first attempt did not land");
+            }
+        }
         if n.kind != NodeKind::Action || n.phase != Phase::Forward {
             continue;
         }
-        if traits.reversibility.needs_compensation() {
+        let strategy = n.recovery.as_ref().and_then(|r| r.strategy);
+        if strategy == Some(crate::flow::RecoveryStrategy::Compensate) && compensators == 0 {
+            c.report.error(
+                "compensation-missing",
+                &path,
+                "strategy 'compensate' requires a declared compensation (action or flow)",
+            );
+        }
+        let declared_not_undone = matches!(
+            strategy,
+            Some(crate::flow::RecoveryStrategy::Retain | crate::flow::RecoveryStrategy::Manual)
+        );
+        if traits.reversibility.needs_compensation() && !declared_not_undone {
             if compensators == 0 {
                 c.report.error(
                     "compensation-missing",
@@ -703,7 +791,7 @@ pub fn validate_flow(
                 );
                 None
             }
-            Some(InvariantScope::Commit) => None,
+            Some(InvariantScope::Commit | InvariantScope::Always) => None,
             Some(InvariantScope::Checkpoint(node)) => match c.graph.node(&node) {
                 Some(n) if n.kind == NodeKind::Checkpoint => Some(c.graph.ancestors(&n.id)),
                 _ => {
@@ -728,7 +816,7 @@ pub fn validate_flow(
     if spec
         .invariants
         .iter()
-        .any(|i| i.parsed_scope() == Some(InvariantScope::Commit))
+        .any(|i| matches!(i.parsed_scope(), Some(InvariantScope::Commit | InvariantScope::Always)))
         && spec.commit.on_violation.is_empty()
     {
         c.report.warn(
@@ -737,6 +825,53 @@ pub fn validate_flow(
             "commit invariants without onViolation entries: a violation ends in MANUAL_INTERVENTION",
         );
     }
+
+    // Transaction-level constraints decidable from the definition.
+    struct Facts {
+        id: String,
+        adapter_type: Option<String>,
+        forward_action: bool,
+        effectful: bool,
+        traits: NodeTraits,
+        has_compensator: bool,
+        verified: bool,
+    }
+    let facts: Vec<Facts> = spec
+        .nodes
+        .iter()
+        .map(|n| {
+            let op = resolve_operation(spec, n, catalog).ok().flatten();
+            let traits = node_traits(n, op.map(|x| x.1));
+            let effectful = n.kind.is_effectful() && traits.effect.is_effectful();
+            Facts {
+                id: n.id.clone(),
+                adapter_type: op.map(|(d, _)| d.adapter_type.clone()),
+                forward_action: effectful && n.kind == NodeKind::Action && n.phase == Phase::Forward,
+                effectful,
+                traits,
+                has_compensator: c.graph.compensator_of(&n.id).is_some(),
+                verified: traits.verification == VerificationStrategy::ReadBack
+                    || !c.graph.verifiers_of(&n.id).is_empty(),
+            }
+        })
+        .collect();
+    let views: Vec<crate::constraints::StaticAction<'_>> = facts
+        .iter()
+        .zip(&spec.nodes)
+        .map(|(f, n)| crate::constraints::StaticAction {
+            id: &f.id,
+            adapter_type: f.adapter_type.as_deref(),
+            forward_action: f.forward_action,
+            effectful: f.effectful,
+            reversibility: f.traits.reversibility,
+            has_compensator: f.has_compensator,
+            verified: f.verified,
+            cost: n.cost.as_ref(),
+        })
+        .collect();
+    c.report
+        .errors
+        .extend(crate::constraints::check_static(&policy.spec.constraints, &views));
 
     c.report
 }

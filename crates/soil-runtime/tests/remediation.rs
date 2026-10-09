@@ -386,6 +386,7 @@ fn unknown_invariant_blocks_commit() {
             description: None,
             expr: "facts.verify_slo.saturation < 0.8".into(),
             scope: "commit".into(),
+            severity: Default::default(),
             on_unknown: OnUnknown::Allow,
         });
     });

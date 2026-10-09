@@ -28,9 +28,11 @@ spec:
       config_version: {default: cfg-18, description: Config version shipped with the fix}
       max_error_rate: {default: 0.01, description: SLO error budget for the commit invariant}
 
+  # AgentScript/Crane authorizes; Soil consumes the result for exactly this contract version.
   authority:
     provider: crane
-    reference: crane://grants/payments/remediation-prod
+    contractId: payments/remediation-prod
+    contractHash: "sha256:4e7d0c51f2a9b8e3d6c1a7f04b2e9d8c3a5f6e7b1c2d3e4f5a6b7c8d9e0f1a2b"
 
   policies: [prod-safety]
 

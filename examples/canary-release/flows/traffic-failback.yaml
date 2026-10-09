@@ -1,0 +1,49 @@
+# Compensation flow for a canary traffic shift: put the canary weight back and confirm it.
+# Pinned by version from canary-release's recovery graph and run as a nested transaction.
+apiVersion: soil.dev/v1alpha1
+kind: Flow
+metadata:
+  name: traffic-failback
+  description: Restore the canary weight and confirm the routing took effect.
+spec:
+  intent:
+    summary: "Fail ${inputs.service} traffic back to ${inputs.canary_weight}% canary"
+    actor: soil:recovery
+    principal: team:platform
+    inputs:
+      service: {required: true}
+      canary_weight: {required: true}
+
+  authority:
+    provider: crane
+    contractId: platform/traffic-failback
+    contractHash: "sha256:8c2e4a6b0d1f3e5a7c9b1d3f5e7a9c0b2d4f6e8a0c1b3d5f7e9a1c2b4d6f8e0a"
+
+  adapters:
+    k8s: {type: kubernetes, version: 1, config: {region: eu-west-1}}
+
+  nodes:
+    - id: restore
+      kind: ACTION
+      label: Restore canary weight
+      adapter: k8s
+      operation: traffic.restore
+      resource: "k8s://prod/${inputs.service}/traffic/api"
+      params: {canary_weight: "${inputs.canary_weight}"}
+      # If failing back itself goes wrong, a human decides: there is no compensation for it.
+      recovery: {strategy: manual}
+      ui: {x: 0, y: 0}
+    - id: confirm_failback
+      kind: VERIFY
+      label: Confirm routing
+      adapter: k8s
+      operation: deployment.status
+      resource: "k8s://prod/${inputs.service}/deployment/api"
+      checks: ["observed.traffic.canary == inputs.canary_weight"]
+      ui: {x: 230, y: 0}
+
+  edges:
+    - {from: restore, to: confirm_failback, type: DEPENDS_ON}
+
+  commit:
+    requires: [confirm_failback]

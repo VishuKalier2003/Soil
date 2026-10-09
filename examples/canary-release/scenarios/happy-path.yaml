@@ -1,0 +1,15 @@
+apiVersion: soil.dev/v1alpha1
+kind: SimScenario
+metadata:
+  name: happy-path
+spec:
+  description: "The new image is healthy; the transaction commits only after the SLO is verified."
+  expect: COMMITTED
+  inputs: {image: "ghcr.io/acme/checkout:3.1.0"}
+  world:
+    deployments:
+      prod/checkout/api: {image: "ghcr.io/acme/checkout:3.0.4", configVersion: cfg-12, replicas: 6}
+    traffic:
+      prod/checkout/api: {canary: 0}
+    http:
+      "https://slo.test/checkout": {error_rate: 0.002, p99_ms: 140}
